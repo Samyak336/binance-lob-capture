@@ -1,0 +1,10 @@
+build/
+build-*/
+output/
+*.csv
+!samples/*.csv
+*.o
+*.a
+*.so
+.env
+config/secrets.json
