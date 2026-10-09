@@ -36,17 +36,37 @@ static DecodeError parseLevels(ondemand::value& v, F&& onLevel) {
     return DecodeError::None;
 }
 
-// depth5 levels have to come best first, with qty > 0, and at most 5 of them
+// snapshot levels (depth5 or REST) have to come strictly best first with qty > 0.
+// store() keeps the level, or returns false if there's no room left for it
+template <Side S, typename Store>
+static DecodeError parseSnapshotSide(ondemand::value& v, Store&& store) {
+    bool first = true;
+    int64_t prev = 0;
+    return parseLevels(v, [&](const Level& l) {
+        bool worseThanPrev = S == Side::Bid ? l.price < prev : l.price > prev;
+        if (l.qty <= 0 || (!first && !worseThanPrev)) return false;
+        first = false;
+        prev = l.price;
+        return store(l);
+    });
+}
+
 template <Side S>
 static DecodeError parseTop5(ondemand::value& v, std::array<Level, TOP_N>& out, int& n) {
     n = 0;
-    return parseLevels(v, [&](const Level& l) {
-        if (n == TOP_N || l.qty <= 0) return false;
-        if (n > 0) {
-            bool worseThanPrev = S == Side::Bid ? l.price < out[n - 1].price : l.price > out[n - 1].price;
-            if (!worseThanPrev) return false;
-        }
+    return parseSnapshotSide<S>(v, [&](const Level& l) {
+        if (n == TOP_N) return false;
         out[n++] = l;
+        return true;
+    });
+}
+
+template <Side S>
+static DecodeError parseDeep(ondemand::value& v, std::vector<Level>& out) {
+    out.clear();
+    return parseSnapshotSide<S>(v, [&](const Level& l) {
+        if (static_cast<int>(out.size()) == MAX_SNAPSHOT_LEVELS) return false;
+        out.push_back(l);
         return true;
     });
 }
@@ -110,6 +130,31 @@ DecodeError decodeDepth5(ondemand::object& obj, Venue venue, Depth5& out) {
             hasBids = true;
         } else if (key == asksKey) {
             err = parseTop5<Side::Ask>(field.value(), out.asks, out.nAsks);
+            hasAsks = true;
+        }
+        if (err != DecodeError::None) return err;
+    }
+    if (!hasId || !hasBids || !hasAsks) return DecodeError::MissingField;
+    return DecodeError::None;
+}
+
+DecodeError decodeRestSnapshot(ondemand::object& obj, RestSnapshot& out) {
+    bool hasId = false, hasBids = false, hasAsks = false;
+    for (auto f : obj) {
+        ondemand::field field;
+        if (std::move(f).get(field)) return DecodeError::Json;
+        std::string_view key;
+        if (field.unescaped_key().get(key)) return DecodeError::Json;
+
+        DecodeError err = DecodeError::None;
+        if (key == "lastUpdateId") {
+            if (field.value().get_uint64().get(out.lastId)) return DecodeError::Json;
+            hasId = true;
+        } else if (key == "bids") {
+            err = parseDeep<Side::Bid>(field.value(), out.bids);
+            hasBids = true;
+        } else if (key == "asks") {
+            err = parseDeep<Side::Ask>(field.value(), out.asks);
             hasAsks = true;
         }
         if (err != DecodeError::None) return err;

@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
     logMsg(LogLevel::Info, "simdjson kernel: %s", simdjson::builtin_implementation()->name().c_str());
 
     Metrics metrics;
-    int rc = cfg.replay ? runReplay(cfg.replayFile, cfg.outputDir, metrics) : runLive(cfg, metrics);
+    int rc = cfg.replay ? runReplay(cfg, metrics) : runLive(cfg, metrics);
     metrics.print(stderr, cfg.replay ? "replay" : "live");
     return rc;
 }

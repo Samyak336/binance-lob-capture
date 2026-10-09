@@ -11,4 +11,7 @@ __attribute__((format(printf, 2, 3)))
 #endif
 void logMsg(LogLevel level, const char* fmt, ...);
 
+// lines below this level are dropped (default Info, i.e. everything)
+void setLogLevel(LogLevel minimum);
+
 }  // namespace capture

@@ -7,7 +7,12 @@
 
 namespace capture {
 
+static LogLevel minLevel = LogLevel::Info;
+
+void setLogLevel(LogLevel minimum) { minLevel = minimum; }
+
 void logMsg(LogLevel level, const char* fmt, ...) {
+    if (level < minLevel) return;
     using namespace std::chrono;
     auto now = system_clock::now();
     std::time_t secs = system_clock::to_time_t(now);

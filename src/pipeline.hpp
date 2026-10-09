@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "book_sync.hpp"
 #include "csv.hpp"
@@ -20,9 +22,14 @@ constexpr std::string_view BOOK_HEADER =
     "bid0,bid1,bid2,bid3,bid4,bid_size0,bid_size1,bid_size2,bid_size3,bid_size4,"
     "ask0,ask1,ask2,ask3,ask4,ask_size0,ask_size1,ask_size2,ask_size3,ask_size4";
 
+// REST snapshots (rest mode only), so replay doesn't need the network
+constexpr std::string_view SNAPSHOT_HEADER =
+    "recv_tsec,recv_tnsec,venue,shard_id,conn_epoch,after_conn_seq,symbol,depth_limit,payload_json";
+
 // values for the `type` column
 constexpr char ROW_DIFF = 'D';   // depthUpdate applied
 constexpr char ROW_DEPTH5 = 'P'; // depth5 seeded or verified the book
+constexpr char ROW_REST = 'S';   // REST snapshot seeded the book
 constexpr char ROW_TRADE = 'T';  // trade, book unchanged (just an annotation)
 constexpr char ROW_RESET = 'R';  // book dropped because of a gap/reconnect, all levels 0
 
@@ -32,19 +39,29 @@ int32_t instrumentId(Venue venue, std::string_view symbol);
 
 // Handles one symbol: write the market data row, decode, update the book,
 // write the order book row.
-// Live mode calls onMessage(), replay calls process() with rows read back from the
-// market data csv. The order book side only depends on what's in that csv, which
-// is why a replay produces exactly the same order book file.
+// Live mode calls onMessage() / onRestSnapshot(), replay calls process() /
+// processRestSnapshot() with rows read back from the csv files. The order book
+// side only depends on what's in those files, which is why a replay produces
+// exactly the same order book file.
 class SymbolPipeline {
 public:
-    SymbolPipeline(Venue venue, std::string symbol, Metrics& metrics);
+    SymbolPipeline(Venue venue, SeedMode seedMode, std::string symbol, Metrics& metrics);
 
-    // empty marketPath = don't write market data (replay)
-    bool open(const std::string& marketPath, const std::string& bookPath);
+    // empty path = don't write that file (replay only writes the order book)
+    bool open(const std::string& marketPath, const std::string& bookPath, const std::string& snapshotPath);
 
     // payload is the minified inner `data` object, obj is the same object ready to iterate
     void onMessage(const MessageMeta& meta, std::string_view payload, simdjson::ondemand::object& obj);
     void process(const MessageMeta& meta, simdjson::ondemand::object& obj);
+
+    // a REST snapshot arrived (already decoded). it's saved together with this
+    // symbol's last market data row, which is where replay applies it again
+    void onRestSnapshot(int64_t recvNs, int depthLimit, std::string_view payload, const RestSnapshot& snap);
+    void processRestSnapshot(const SnapshotMeta& meta, const RestSnapshot& snap);
+
+    // live mode hooks this up to the REST client. called (at most once until the
+    // answer comes back) when the book needs a snapshot
+    void setSnapshotRequester(std::function<void(SymbolPipeline&)> requester) { requester_ = std::move(requester); }
 
     void flush();
     void close();
@@ -58,8 +75,10 @@ public:
 
 private:
     void writeMarketRow(const MessageMeta& meta, std::string_view payload);
-    void writeBookRow(const MessageMeta& meta, char type, char side);
+    void writeSnapshotRow(const SnapshotMeta& meta, std::string_view payload);
+    void writeBookRow(int64_t sec, int32_t nsec, char type, char side);
     void decodeFailed(const MessageMeta& meta, DecodeError err);
+    void maybeRequestSnapshot();
 
     Venue venue_;
     std::string symbol_;      // BTCUSDT
@@ -69,7 +88,12 @@ private:
     BookSync sync_;
     CsvWriter marketCsv_;
     CsvWriter bookCsv_;
+    CsvWriter snapshotCsv_{0};  // a few big rows per run, written straight away
     uint64_t seqNo_ = 0;
+
+    MessageMeta last_;  // last market data message, the anchor for REST snapshots
+    std::function<void(SymbolPipeline&)> requester_;
+    bool snapshotRequested_ = false;
 
     // decode targets, reused for every message
     DepthDiff diff_;

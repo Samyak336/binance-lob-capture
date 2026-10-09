@@ -38,11 +38,17 @@ void Metrics::print(std::FILE* out, const char* label) const {
                  label, diffsApplied, diffsStale, diffsBuffered, bufferOverflows, gaps, epochResets, seeds,
                  seedFailures, decodeErrors);
     std::fprintf(out,
-                 "[%s] depth5: checks=%" PRIu64 " stale=%" PRIu64 " superseded=%" PRIu64
+                 "[%s] depth5: checks=%" PRIu64 " stale=%" PRIu64 " superseded=%" PRIu64 " ignored=%" PRIu64
                  " levels_mismatched=%" PRIu64 " levels_learned=%" PRIu64 " | trades=%" PRIu64
                  " uncertain_rows=%" PRIu64 "\n",
-                 label, depth5Checks, depth5Stale, depth5Superseded, levelsMismatched, levelsLearned, trades,
-                 uncertainRows);
+                 label, depth5Checks, depth5Stale, depth5Superseded, depth5Ignored, levelsMismatched, levelsLearned,
+                 trades, uncertainRows);
+    if (snapshotsRequested > 0 || snapshotsReceived > 0) {
+        std::fprintf(out,
+                     "[%s] rest: requested=%" PRIu64 " received=%" PRIu64 " unused=%" PRIu64 " errors=%" PRIu64
+                     " weight_1m=%" PRIu64 "\n",
+                     label, snapshotsRequested, snapshotsReceived, snapshotsUnused, snapshotErrors, restWeightUsed);
+    }
     std::fprintf(out, "[%s] output: market_rows=%" PRIu64 " book_rows=%" PRIu64 " write_errors=%" PRIu64 "\n",
                  label, marketRows, bookRows, writeErrors);
     if (latency.count() > 0) {

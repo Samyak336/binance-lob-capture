@@ -72,7 +72,7 @@ target_include_directories(blc_core PUBLIC src)
 target_link_libraries(blc_core PUBLIC blc_simdjson blc_options)
 target_compile_options(blc_core PRIVATE ${BLC_WARNINGS})
 
-add_executable(binance_capture src/main.cpp src/live.cpp)
+add_executable(binance_capture src/main.cpp src/live.cpp src/snapshot_fetcher.cpp)
 target_link_libraries(binance_capture PRIVATE blc_core Boost::headers OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 target_compile_definitions(binance_capture PRIVATE BOOST_BEAST_USE_STD_STRING_VIEW BOOST_ASIO_NO_DEPRECATED)
 target_compile_options(binance_capture PRIVATE ${BLC_WARNINGS})

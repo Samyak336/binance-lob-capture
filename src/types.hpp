@@ -14,11 +14,20 @@ constexpr int64_t SCALE = 100'000'000;
 // levels per side in the order book csv
 constexpr int TOP_N = 5;
 
+// biggest REST snapshot binance gives (spot limit=5000, futures stops at 1000)
+constexpr int MAX_SNAPSHOT_LEVELS = 5000;
+
 enum class Venue : uint8_t { Spot, UsdM };
 enum class StreamKind : uint8_t { DepthDiff, Depth5, Trade };
 enum class Side : uint8_t { Bid, Ask };
 
+// where a book that isn't live gets its starting state from
+//   Rest   - GET /api/v3/depth (or /fapi/v1/depth), the way binance's docs describe it
+//   Depth5 - the next depth5 message. no REST calls, but at first only 5 levels are known
+enum class SeedMode : uint8_t { Rest, Depth5 };
+
 constexpr std::string_view toString(Venue v) { return v == Venue::Spot ? "spot" : "usdm"; }
+constexpr std::string_view toString(SeedMode m) { return m == SeedMode::Rest ? "rest" : "depth5"; }
 
 constexpr std::string_view toString(StreamKind k) {
     switch (k) {
@@ -42,6 +51,12 @@ constexpr bool parseStreamKind(std::string_view s, StreamKind& out) {
     return false;
 }
 
+constexpr bool parseSeedMode(std::string_view s, SeedMode& out) {
+    if (s == "rest") { out = SeedMode::Rest; return true; }
+    if (s == "depth5") { out = SeedMode::Depth5; return true; }
+    return false;
+}
+
 struct Level {
     int64_t price = 0;
     int64_t qty = 0;
@@ -59,6 +74,18 @@ struct MessageMeta {
     uint32_t shardId = 0;
     uint64_t connEpoch = 0;
     uint64_t connSeq = 0;
+};
+
+// a REST snapshot doesn't come from the socket, so it has no conn_seq of its own.
+// instead we remember which market data row it came right after (same shard and
+// epoch, conn_seq = afterConnSeq) - that's where replay puts it back
+struct SnapshotMeta {
+    int64_t recvSec = 0;
+    int32_t recvNsec = 0;
+    uint32_t shardId = 0;
+    uint64_t connEpoch = 0;
+    uint64_t afterConnSeq = 0;
+    int depthLimit = 0;  // the limit= it was requested with
 };
 
 }  // namespace capture

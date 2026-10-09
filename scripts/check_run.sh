@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sanity checks for one capture, no network needed:
-#   - both csv headers are exactly what the assignment asks for
+#   - the csv headers are exactly what the assignment asks for
 #   - every order book row has 26 columns
 #   - replaying the market data csv gives back the same order book csv, byte for byte
 #
@@ -10,6 +10,7 @@ set -uo pipefail
 BIN=${BIN:-./build/binance_capture}
 md=${1:?usage: $0 market_data_<venue>_<SYMBOL>_<date>.csv}
 ob="${md%.csv}_orderbook.csv"
+sn="${md%.csv}_snapshots.csv"
 status=0
 
 check() {  # check "what" command...
@@ -21,9 +22,15 @@ check() {  # check "what" command...
 md_header='recv_tsec,recv_tnsec,venue,stream_kind,shard_id,conn_epoch,conn_seq,symbol,payload_json'
 ob_header='tsec,tnsec,seqNo,id,type,side,bid0,bid1,bid2,bid3,bid4,bid_size0,bid_size1,bid_size2,bid_size3,bid_size4,ask0,ask1,ask2,ask3,ask4,ask_size0,ask_size1,ask_size2,ask_size3,ask_size4'
 
+sn_header='recv_tsec,recv_tnsec,venue,shard_id,conn_epoch,after_conn_seq,symbol,depth_limit,payload_json'
+
 check "market data header" test "$(head -1 "$md")" = "$md_header"
 check "order book header" test "$(head -1 "$ob")" = "$ob_header"
 check "every order book row has 26 columns" test "$(awk -F',' 'NR > 1 && NF != 26' "$ob" | wc -l)" -eq 0
+# only there when the book was started from REST snapshots (the default)
+if [ -f "$sn" ]; then
+    check "snapshots header" test "$(head -1 "$sn")" = "$sn_header"
+fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT

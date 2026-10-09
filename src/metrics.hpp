@@ -47,10 +47,18 @@ struct Metrics {
     uint64_t depth5Checks = 0;
     uint64_t depth5Stale = 0;
     uint64_t depth5Superseded = 0;
+    uint64_t depth5Ignored = 0;  // book not live and waiting for a REST snapshot
     uint64_t levelsMismatched = 0;
     uint64_t levelsLearned = 0;
     uint64_t trades = 0;
     uint64_t uncertainRows = 0;
+
+    // REST snapshots
+    uint64_t snapshotsRequested = 0;
+    uint64_t snapshotsReceived = 0;  // live: answered requests, replay: rows in the snapshots file
+    uint64_t snapshotsUnused = 0;    // arrived when the book was already live
+    uint64_t snapshotErrors = 0;     // network / http / json problems (each one retried)
+    uint64_t restWeightUsed = 0;     // last X-MBX-USED-WEIGHT-1M binance sent back
 
     // output
     uint64_t marketRows = 0;

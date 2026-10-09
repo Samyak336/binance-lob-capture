@@ -51,7 +51,8 @@ class CsvWriter {
 public:
     static constexpr size_t FLUSH_AT = 256 * 1024;
 
-    CsvWriter() = default;
+    // bufferSize = initial buffer, it grows if a row needs more
+    explicit CsvWriter(size_t bufferSize = FLUSH_AT + 64 * 1024) : buf_(bufferSize) {}
     CsvWriter(const CsvWriter&) = delete;
     CsvWriter& operator=(const CsvWriter&) = delete;
     ~CsvWriter() { close(); }
@@ -79,7 +80,7 @@ private:
     };
 
     std::unique_ptr<std::FILE, Closer> file_;
-    OutBuffer buf_{FLUSH_AT + 64 * 1024};
+    OutBuffer buf_;
     std::string path_;
     uint64_t rows_ = 0;
     uint64_t writeErrors_ = 0;

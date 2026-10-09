@@ -2,7 +2,8 @@
 
 namespace capture {
 
-BookSync::BookSync(Venue venue, Metrics& metrics) : venue_(venue), metrics_(metrics), ring_(MAX_BUFFERED) {}
+BookSync::BookSync(Venue venue, SeedMode seedMode, Metrics& metrics)
+    : venue_(venue), seedMode_(seedMode), metrics_(metrics), ring_(MAX_BUFFERED) {}
 
 BookEffect BookSync::onEpoch(uint64_t epoch) {
     if (haveEpoch_ && epoch == epoch_) return BookEffect::None;
@@ -34,7 +35,14 @@ BookEffect BookSync::onDiff(const DepthDiff& diff) {
 }
 
 BookEffect BookSync::onDepth5(const Depth5& snap) {
-    if (!live_) return seed(snap) ? BookEffect::Applied : BookEffect::None;
+    if (!live_) {
+        if (seedMode_ == SeedMode::Rest) {  // only the REST snapshot starts the book, depth5 just checks it later
+            metrics_.depth5Ignored++;
+            return BookEffect::None;
+        }
+        bool ok = seed(snap.lastId, snap.bids.data(), snap.nBids, snap.asks.data(), snap.nAsks, TOP_N);
+        return ok ? BookEffect::Applied : BookEffect::None;
+    }
 
     if (snap.lastId == lastId_) {
         refresh(snap, nullptr);
@@ -49,6 +57,17 @@ BookEffect BookSync::onDepth5(const Depth5& snap) {
     pending_ = snap;
     hasPending_ = true;
     return BookEffect::None;
+}
+
+BookEffect BookSync::onRestSnapshot(const RestSnapshot& snap, int depthLimit) {
+    // we only ask for one while the book isn't live, so this would be a late answer
+    if (live_) {
+        metrics_.snapshotsUnused++;
+        return BookEffect::None;
+    }
+    bool ok = seed(snap.lastId, snap.bids.data(), static_cast<int>(snap.bids.size()), snap.asks.data(),
+                   static_cast<int>(snap.asks.size()), depthLimit);
+    return ok ? BookEffect::Applied : BookEffect::None;
 }
 
 BookSync::DiffResult BookSync::apply(const DepthDiff& diff) {
@@ -88,11 +107,12 @@ void BookSync::refresh(const Depth5& snap, const DepthDiff* nextDiff) {
     metrics_.levelsLearned += static_cast<uint64_t>(b.learned + a.learned);
 }
 
-bool BookSync::seed(const Depth5& snap) {
+// same steps for a depth5 (depth 5) and a REST snapshot (depth = its limit)
+bool BookSync::seed(uint64_t lastId, const Level* bids, int nBids, const Level* asks, int nAsks, int depth) {
     book_.clear();
-    book_.bids().replaceTop(snap.bids.data(), snap.nBids, TOP_N, nullptr);
-    book_.asks().replaceTop(snap.asks.data(), snap.nAsks, TOP_N, nullptr);
-    lastId_ = snap.lastId;
+    book_.bids().replaceTop(bids, nBids, depth, nullptr);
+    book_.asks().replaceTop(asks, nAsks, depth, nullptr);
+    lastId_ = lastId;
     live_ = true;
     justSeeded_ = true;
     hasPending_ = false;
@@ -102,7 +122,7 @@ bool BookSync::seed(const Depth5& snap) {
     while (ringSize_ > 0) {
         if (apply(ring_[static_cast<size_t>(ringHead_)]) == DiffResult::Gap) {
             // snapshot is older than the buffered diffs and doesn't connect -
-            // keep them and wait for a newer depth5
+            // keep them and wait for a newer snapshot
             metrics_.seedFailures++;
             live_ = false;
             justSeeded_ = false;

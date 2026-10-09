@@ -22,16 +22,15 @@
 #include <vector>
 
 #include "log.hpp"
+#include "net.hpp"
 #include "pipeline.hpp"
 #include "router.hpp"
+#include "snapshot_fetcher.hpp"
 
 namespace capture {
 
-namespace beast = boost::beast;
 namespace http = beast::http;
 namespace websocket = beast::websocket;
-namespace net = boost::asio;
-namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 using namespace std::chrono_literals;
 
@@ -44,11 +43,6 @@ constexpr auto MAX_BACKOFF = 30s;
 constexpr auto FLUSH_EVERY = 1s;
 constexpr auto SHUTDOWN_GRACE = 5s;
 constexpr size_t MAX_MESSAGE_BYTES = 4 << 20;
-
-static int64_t nowNs() {
-    using namespace std::chrono;
-    return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
-}
 
 static std::string utcDate() {
     std::time_t now = std::time(nullptr);
@@ -127,14 +121,7 @@ private:
     void onConnect(beast::error_code ec, const tcp::resolver::results_type::endpoint_type&) {
         if (ec) return fail("connect", ec);
         auto& tlsStream = ws_->next_layer();
-        // SNI + check the certificate really is for this host.
-        // (this is what the SSL_set_tlsext_host_name macro expands to, minus its C cast)
-        if (!SSL_ctrl(tlsStream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name,
-                      const_cast<char*>(endpoint_.host.c_str()))) {
-            ec.assign(static_cast<int>(::ERR_get_error()), net::error::get_ssl_category());
-            return fail("tls sni", ec);
-        }
-        tlsStream.set_verify_callback(ssl::host_name_verification(endpoint_.host));
+        if (!setTlsHost(tlsStream, endpoint_.host, ec)) return fail("tls sni", ec);
         beast::get_lowest_layer(*ws_).expires_after(CONNECT_TIMEOUT);
         tlsStream.async_handshake(ssl::stream_base::client, beast::bind_front_handler(&Shard::onTlsHandshake, shared_from_this()));
     }
@@ -148,7 +135,7 @@ private:
         t.keep_alive_pings = true;  // ping after half the idle time before giving up
         ws_->set_option(t);
         ws_->set_option(websocket::stream_base::decorator(
-            [](websocket::request_type& req) { req.set(http::field::user_agent, "binance-lob-capture/1.0"); }));
+            [](websocket::request_type& req) { req.set(http::field::user_agent, USER_AGENT); }));
         ws_->read_message_max(MAX_MESSAGE_BYTES);
         ws_->async_handshake(endpoint_.host + ':' + endpoint_.port, target_,
                              beast::bind_front_handler(&Shard::onWsHandshake, shared_from_this()));
@@ -227,17 +214,18 @@ int runLive(const Config& cfg, Metrics& metrics) {
         }
     }
 
-    // one market data file + one order book file per symbol
+    // per symbol: market data file + order book file (+ REST snapshots file in rest mode)
     std::error_code fsErr;
     std::filesystem::create_directories(cfg.outputDir, fsErr);
     std::string date = utcDate();
+    bool rest = cfg.seedMode == SeedMode::Rest;
     std::vector<std::unique_ptr<SymbolPipeline>> pipelines;
     Router router(cfg.venue, metrics);
     for (const std::string& sym : cfg.symbols) {
-        auto p = std::make_unique<SymbolPipeline>(cfg.venue, sym, metrics);
+        auto p = std::make_unique<SymbolPipeline>(cfg.venue, cfg.seedMode, sym, metrics);
         std::string name = "market_data_" + std::string(toString(cfg.venue)) + "_" + sym + "_" + date;
         std::string base = (std::filesystem::path(cfg.outputDir) / name).string();
-        if (!p->open(base + ".csv", base + "_orderbook.csv")) {
+        if (!p->open(base + ".csv", base + "_orderbook.csv", rest ? base + "_snapshots.csv" : "")) {
             logMsg(LogLevel::Error, "can't create output files in %s", cfg.outputDir.c_str());
             return 1;
         }
@@ -245,6 +233,11 @@ int runLive(const Config& cfg, Metrics& metrics) {
         router.add(*p);
         pipelines.push_back(std::move(p));
     }
+    if (rest)
+        logMsg(LogLevel::Info, "books start from REST snapshots (limit=%d, weight %d each)", cfg.snapshotDepth,
+               snapshotWeight(cfg.venue, cfg.snapshotDepth));
+    else
+        logMsg(LogLevel::Info, "books start from depth5 messages (no REST calls)");
 
     net::io_context ioc{1};  // one thread does everything: reads, parsing, book, csv
     ssl::context tls{ssl::context::tls_client};
@@ -282,6 +275,16 @@ int runLive(const Config& cfg, Metrics& metrics) {
     }
     runningShards = shards.size();
 
+    // one REST client for all symbols, so requests go out one at a time
+    std::shared_ptr<SnapshotFetcher> fetcher;
+    if (rest) {
+        fetcher = std::make_shared<SnapshotFetcher>(ioc, tls, cfg.venue, cfg.snapshotDepth, metrics);
+        for (auto& p : pipelines)
+            p->setSnapshotRequester([weak = std::weak_ptr<SnapshotFetcher>(fetcher)](SymbolPipeline& sp) {
+                if (auto f = weak.lock()) f->request(sp);
+            });
+    }
+
     std::function<void(const char*)> shutdown = [&](const char* why) {
         if (stopping) return;
         stopping = true;
@@ -289,6 +292,7 @@ int runLive(const Config& cfg, Metrics& metrics) {
         durationTimer.cancel();
         statsTimer.cancel();
         flushTimer.cancel();
+        if (fetcher) fetcher->stop();
         graceTimer.expires_after(SHUTDOWN_GRACE);
         graceTimer.async_wait([&](beast::error_code ec) {
             if (ec) return;

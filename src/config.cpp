@@ -22,15 +22,34 @@ std::string usage() {
            "  --symbols LIST             comma separated, case doesn't matter (max 200)\n"
            "  --output-dir DIR           where the csv files go (default ./output)\n"
            "  --duration SECONDS         stop after this long (default 0 = until Ctrl+C)\n"
+           "  --snapshot rest|depth5     what starts the book: a REST depth snapshot (default)\n"
+           "                             or the next depth5 message (no REST calls)\n"
+           "  --snapshot-depth N         REST snapshot levels (default spot 5000, usdm 1000)\n"
            "  --symbols-per-shard N      symbols per websocket connection (default 100, max 341)\n"
            "  --stats-interval SECONDS   print a stats line every N seconds (default 10, 0 = off)\n"
            "  --ws-url URL               use another endpoint, e.g. wss://stream.binance.com:443/stream\n"
            "\n"
            "Replay:\n"
            "  --replay FILE              rebuild the order book from FILE, no network;\n"
-           "                             writes DIR/<FILE name>_orderbook.csv\n"
+           "                             writes DIR/<FILE name>_orderbook.csv. uses the\n"
+           "                             <FILE name>_snapshots.csv next to it if there is one\n"
+           "  --snapshot rest|depth5     override that choice\n"
            "\n"
            "  --help, --version\n";
+}
+
+int defaultSnapshotDepth(Venue venue) { return venue == Venue::Spot ? 5000 : 1000; }
+
+bool validSnapshotDepth(Venue venue, int depth) {
+    if (venue == Venue::Spot) return depth >= 1 && depth <= MAX_SNAPSHOT_LEVELS;
+    for (int ok : {5, 10, 20, 50, 100, 500, 1000})
+        if (depth == ok) return true;
+    return false;
+}
+
+int snapshotWeight(Venue venue, int depth) {
+    if (venue == Venue::Spot) return depth <= 100 ? 5 : depth <= 500 ? 25 : depth <= 1000 ? 50 : 250;
+    return depth <= 50 ? 2 : depth <= 100 ? 5 : depth <= 500 ? 10 : 20;
 }
 
 bool parseSymbols(std::string_view list, std::vector<std::string>& out, std::string& error) {
@@ -107,6 +126,7 @@ std::string streamTarget(const Endpoint& endpoint, const std::vector<std::string
 
 ParseResult parseArgs(int argc, const char* const* argv, Config& cfg, std::string& error) {
     bool gotSymbols = false;
+    bool gotDepth = false;
     for (int i = 1; i < argc; i++) {
         std::string_view arg = argv[i];
         std::string_view inlineValue;
@@ -156,6 +176,12 @@ ParseResult parseArgs(int argc, const char* const* argv, Config& cfg, std::strin
         } else if (arg == "--stats-interval") {
             if (!value(v) || !toNumber(v, cfg.statsIntervalSec) || cfg.statsIntervalSec < 0)
                 return bad("--stats-interval expects whole seconds");
+        } else if (arg == "--snapshot") {
+            if (!value(v) || !parseSeedMode(v, cfg.seedMode)) return bad("--snapshot must be rest or depth5");
+            cfg.seedModeGiven = true;
+        } else if (arg == "--snapshot-depth") {
+            if (!value(v) || !toNumber(v, cfg.snapshotDepth)) return bad("--snapshot-depth expects a number");
+            gotDepth = true;
         } else if (arg == "--ws-url") {
             Endpoint check;
             if (!value(v) || !parseWsUrl(v, check, error)) return bad("bad --ws-url");
@@ -171,6 +197,14 @@ ParseResult parseArgs(int argc, const char* const* argv, Config& cfg, std::strin
     }
     if (!cfg.replay && !gotSymbols) {
         error = "--symbols is required for live capture";
+        return ParseResult::Error;
+    }
+    // checked last because it depends on --venue, which can come later on the line
+    if (!gotDepth) {
+        cfg.snapshotDepth = defaultSnapshotDepth(cfg.venue);
+    } else if (!validSnapshotDepth(cfg.venue, cfg.snapshotDepth)) {
+        error = cfg.venue == Venue::Spot ? "--snapshot-depth must be 1..5000 for spot"
+                                         : "--snapshot-depth must be 5, 10, 20, 50, 100, 500 or 1000 for usdm";
         return ParseResult::Error;
     }
     return ParseResult::Run;

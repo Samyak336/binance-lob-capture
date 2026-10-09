@@ -13,6 +13,7 @@
 #include "config.hpp"
 #include "csv.hpp"
 #include "decimal.hpp"
+#include "log.hpp"
 #include "order_book.hpp"
 #include "pipeline.hpp"
 #include "replay.hpp"
@@ -101,6 +102,20 @@ static int countCommas(const std::string& s) {
     return n;
 }
 
+static int countRows(const fs::path& bookCsv, char type) {
+    int n = 0;
+    for (const auto& row : readLines(bookCsv)) n += col(row, 4) == std::string(1, type);
+    return n;
+}
+
+static Config replayConfig(const fs::path& market, const fs::path& outDir) {
+    Config cfg;
+    cfg.replay = true;
+    cfg.replayFile = market.string();
+    cfg.outputDir = outDir.string();
+    return cfg;
+}
+
 static DepthDiff makeDiff(uint64_t first, uint64_t last, std::vector<Level> bids, std::vector<Level> asks,
                           uint64_t prev = 0) {
     DepthDiff d;
@@ -149,6 +164,41 @@ static std::string depth5Frame(uint64_t id, const JsonLevels& bids, const JsonLe
 static std::string tradeFrame(const std::string& price, const std::string& qty, bool buyerIsMaker) {
     return R"({"stream":"btcusdt@trade","data":{"e":"trade","E":1,"s":"BTCUSDT","t":1,"p":")" + price +
            "\",\"q\":\"" + qty + "\",\"T\":1,\"m\":" + (buyerIsMaker ? "true" : "false") + ",\"M\":true}}";
+}
+
+// body of GET /api/v3/depth
+static std::string restJson(uint64_t id, const JsonLevels& bids, const JsonLevels& asks) {
+    return "{\"lastUpdateId\":" + std::to_string(id) + ",\"bids\":" + jsonLevels(bids) + ",\"asks\":" +
+           jsonLevels(asks) + "}";
+}
+
+static DecodeError decodeRestJson(const std::string& json, RestSnapshot& out) {
+    static simdjson::ondemand::parser parser;
+    simdjson::padded_string padded(json);
+    simdjson::ondemand::document doc;
+    simdjson::ondemand::object obj;
+    if (parser.iterate(padded).get(doc) || doc.get_object().get(obj)) return DecodeError::Json;
+    return decodeRestSnapshot(obj, out);
+}
+
+static RestSnapshot makeRest(uint64_t id, std::vector<Level> bids, std::vector<Level> asks) {
+    RestSnapshot s;
+    s.lastId = id;
+    s.bids = std::move(bids);
+    s.asks = std::move(asks);
+    return s;
+}
+
+// ten levels a side, deeper than depth5
+static std::vector<Level> deepBids(int64_t top) {
+    std::vector<Level> v;
+    for (int64_t p = top; p > top - 10; p--) v.push_back({p, 1});
+    return v;
+}
+static std::vector<Level> deepAsks(int64_t bottom) {
+    std::vector<Level> v;
+    for (int64_t p = bottom; p < bottom + 10; p++) v.push_back({p, 1});
+    return v;
 }
 
 static const JsonLevels BIDS5 = {{"100.00", "1"}, {"99.00", "1"}, {"98.00", "1"}, {"97.00", "1"}, {"96.00", "1"}};
@@ -342,7 +392,7 @@ TEST(book_trims_far_levels) {
 
 TEST(spot_seeds_from_depth5_and_detects_gaps) {
     Metrics m;
-    BookSync s(Venue::Spot, m);
+    BookSync s(Venue::Spot, SeedMode::Depth5, m);
     s.onEpoch(0);
     CHECK(s.onDiff(makeDiff(90, 95, {{100, 9}}, {})) == BookEffect::None);  // not live yet, buffered
     CHECK(s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101))) == BookEffect::Applied);
@@ -360,7 +410,7 @@ TEST(spot_seeds_from_depth5_and_detects_gaps) {
 
 TEST(spot_replays_buffered_diffs_newer_than_seed) {
     Metrics m;
-    BookSync s(Venue::Spot, m);
+    BookSync s(Venue::Spot, SeedMode::Depth5, m);
     s.onEpoch(0);
     s.onDiff(makeDiff(95, 100, {}, {}));
     s.onDiff(makeDiff(101, 104, {{100, 7}}, {}));
@@ -371,7 +421,7 @@ TEST(spot_replays_buffered_diffs_newer_than_seed) {
 
 TEST(spot_seed_waits_if_snapshot_too_old) {
     Metrics m;
-    BookSync s(Venue::Spot, m);
+    BookSync s(Venue::Spot, SeedMode::Depth5, m);
     s.onEpoch(0);
     s.onDiff(makeDiff(105, 110, {{100, 3}}, {}));
     CHECK(s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101))) == BookEffect::None);  // 101..104 missing
@@ -384,7 +434,7 @@ TEST(spot_seed_waits_if_snapshot_too_old) {
 
 TEST(depth5_ahead_of_its_diff_gets_applied_with_it) {
     Metrics m;
-    BookSync s(Venue::Spot, m);
+    BookSync s(Venue::Spot, SeedMode::Depth5, m);
     s.onEpoch(0);
     s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101)));
     // this is the usual order on spot: depth5(L) shows up just before the diff ending at L
@@ -397,7 +447,7 @@ TEST(depth5_ahead_of_its_diff_gets_applied_with_it) {
 
 TEST(depth5_catches_and_fixes_a_wrong_level) {
     Metrics m;
-    BookSync s(Venue::Spot, m);
+    BookSync s(Venue::Spot, SeedMode::Depth5, m);
     s.onEpoch(0);
     s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101)));
     s.onDiff(makeDiff(101, 101, {{100, 5}}, {}));
@@ -410,7 +460,7 @@ TEST(depth5_catches_and_fixes_a_wrong_level) {
 
 TEST(new_epoch_resets_the_book) {
     Metrics m;
-    BookSync s(Venue::Spot, m);
+    BookSync s(Venue::Spot, SeedMode::Depth5, m);
     CHECK(s.onEpoch(0) == BookEffect::None);
     s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101)));
     CHECK(s.onEpoch(0) == BookEffect::None);
@@ -424,7 +474,7 @@ TEST(new_epoch_resets_the_book) {
 
 TEST(usdm_chains_on_pu) {
     Metrics m;
-    BookSync s(Venue::UsdM, m);
+    BookSync s(Venue::UsdM, SeedMode::Depth5, m);
     s.onEpoch(0);
     // on futures the depth5 id falls inside a diff's range, here (1000, 1010]
     CHECK(s.onDepth5(makeDepth5(1005, bidsFrom(100), asksFrom(101))) == BookEffect::Applied);
@@ -438,7 +488,7 @@ TEST(usdm_chains_on_pu) {
 
 TEST(usdm_depth5_inside_next_diff_is_checked_against_it) {
     Metrics m;
-    BookSync s(Venue::UsdM, m);
+    BookSync s(Venue::UsdM, SeedMode::Depth5, m);
     s.onEpoch(0);
     s.onDepth5(makeDepth5(1005, bidsFrom(100), asksFrom(101)));
     s.onDiff(makeDiff(1001, 1010, {}, {}, 1000));
@@ -449,13 +499,82 @@ TEST(usdm_depth5_inside_next_diff_is_checked_against_it) {
     CHECK_EQ(m.levelsMismatched, 0u);
 }
 
+// ---- sync logic, REST snapshots (the default)
+
+TEST(rest_seed_follows_binance_procedure) {
+    Metrics m;
+    BookSync s(Venue::Spot, SeedMode::Rest, m);
+    s.onEpoch(0);
+    CHECK(!s.needsSnapshot());
+    CHECK(s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101))) == BookEffect::None);  // can't start the book
+    CHECK_EQ(m.depth5Ignored, 1u);
+    CHECK(s.onDiff(makeDiff(95, 101, {{100, 4}}, {})) == BookEffect::None);
+    CHECK(s.needsSnapshot());
+    s.onDiff(makeDiff(102, 104, {{99, 0}}, {}));
+    // first buffered diff ends before 103 -> dropped, second one has U <= 103+1 -> applied
+    CHECK(s.onRestSnapshot(makeRest(103, deepBids(100), deepAsks(101)), 1000) == BookEffect::Applied);
+    CHECK(s.live());
+    CHECK(!s.needsSnapshot());
+    CHECK_EQ(s.lastUpdateId(), 104u);
+    CHECK_EQ(m.diffsStale, 1u);
+    CHECK_EQ(s.book().bids().best(1).price, 98);  // 99 removed by the diff
+    CHECK(s.book().topVerified());                 // ten levels known, not just five
+    // nobody asked for this one
+    CHECK(s.onRestSnapshot(makeRest(104, deepBids(100), deepAsks(101)), 1000) == BookEffect::None);
+    CHECK_EQ(m.snapshotsUnused, 1u);
+}
+
+TEST(rest_snapshot_older_than_buffer_is_fetched_again) {
+    Metrics m;
+    BookSync s(Venue::Spot, SeedMode::Rest, m);
+    s.onEpoch(0);
+    s.onDiff(makeDiff(105, 110, {{100, 3}}, {}));
+    CHECK(s.onRestSnapshot(makeRest(100, deepBids(100), deepAsks(101)), 1000) == BookEffect::None);  // 101..104 missing
+    CHECK(!s.live());
+    CHECK(s.needsSnapshot());
+    CHECK_EQ(m.seedFailures, 1u);
+    CHECK(s.onRestSnapshot(makeRest(107, deepBids(100), deepAsks(101)), 1000) == BookEffect::Applied);
+    CHECK_EQ(s.lastUpdateId(), 110u);
+    CHECK_EQ(s.book().bids().best(0).qty, 3);
+}
+
+TEST(usdm_rest_seed_straddles_snapshot_id) {
+    Metrics m;
+    BookSync s(Venue::UsdM, SeedMode::Rest, m);
+    s.onEpoch(0);
+    s.onDiff(makeDiff(990, 1000, {}, {}, 985));
+    s.onDiff(makeDiff(1001, 1010, {{100, 3}}, {}, 1000));
+    // futures docs: drop u < lastUpdateId, the first one applied has U <= lastUpdateId <= u
+    CHECK(s.onRestSnapshot(makeRest(1005, deepBids(100), deepAsks(101)), 1000) == BookEffect::Applied);
+    CHECK_EQ(s.lastUpdateId(), 1010u);
+    CHECK_EQ(s.book().bids().best(0).qty, 3);
+    CHECK(s.onDiff(makeDiff(1011, 1020, {}, {}, 1010)) == BookEffect::Applied);
+    CHECK(s.onDiff(makeDiff(1031, 1040, {}, {}, 1025)) == BookEffect::Reset);  // pu != last u
+    CHECK(s.needsSnapshot());
+}
+
+TEST(rest_snapshot_decoding) {
+    RestSnapshot s;
+    CHECK(decodeRestJson(restJson(7, {{"100.0", "1"}, {"99.5", "2"}}, {{"100.5", "3"}}), s) == DecodeError::None);
+    CHECK_EQ(s.lastId, 7u);
+    CHECK_EQ(s.bids.size(), 2u);
+    CHECK_EQ(s.bids[1].price, 9950000000);
+    CHECK_EQ(s.asks[0].qty, 300000000);
+    // futures sends E and T too
+    CHECK(decodeRestJson(R"({"lastUpdateId":9,"E":1,"T":2,"bids":[],"asks":[["1","1"]]})", s) == DecodeError::None);
+    CHECK_EQ(s.bids.size(), 0u);
+    CHECK(decodeRestJson(restJson(7, {{"99", "1"}, {"100", "1"}}, {}), s) == DecodeError::BadLevels);  // not best first
+    CHECK(decodeRestJson(restJson(7, {{"100", "0"}}, {}), s) == DecodeError::BadLevels);               // qty 0
+    CHECK(decodeRestJson(R"({"lastUpdateId":7,"bids":[]})", s) == DecodeError::MissingField);
+}
+
 // ---- end to end through the router
 
 TEST(router_writes_both_csvs_exactly) {
     fs::path dir = freshDir("router");
     Metrics m;
-    SymbolPipeline p(Venue::Spot, "BTCUSDT", m);
-    CHECK(p.open((dir / "md.csv").string(), (dir / "md_orderbook.csv").string()));
+    SymbolPipeline p(Venue::Spot, SeedMode::Depth5, "BTCUSDT", m);
+    CHECK(p.open((dir / "md.csv").string(), (dir / "md_orderbook.csv").string(), ""));
     Router r(Venue::Spot, m);
     r.add(p);
     r.onMessage(0, 0, 0, T0, depth5Frame(100, BIDS5, ASKS5));
@@ -494,8 +613,8 @@ TEST(router_writes_both_csvs_exactly) {
 TEST(router_minifies_payload_with_spaces) {
     fs::path dir = freshDir("minify");
     Metrics m;
-    SymbolPipeline p(Venue::Spot, "BTCUSDT", m);
-    CHECK(p.open((dir / "md.csv").string(), (dir / "ob.csv").string()));
+    SymbolPipeline p(Venue::Spot, SeedMode::Depth5, "BTCUSDT", m);
+    CHECK(p.open((dir / "md.csv").string(), (dir / "ob.csv").string(), ""));
     Router r(Venue::Spot, m);
     r.add(p);
     // keys in the other order + whitespace everywhere
@@ -514,8 +633,8 @@ TEST(replay_matches_live_byte_for_byte) {
     fs::path book = dir / "market_data_spot_BTCUSDT_2026-01-01_orderbook.csv";
     Metrics live;
     {
-        SymbolPipeline p(Venue::Spot, "BTCUSDT", live);
-        CHECK(p.open(market.string(), book.string()));
+        SymbolPipeline p(Venue::Spot, SeedMode::Depth5, "BTCUSDT", live);
+        CHECK(p.open(market.string(), book.string(), ""));
         Router r(Venue::Spot, live);
         r.add(p);
         uint64_t seq = 0;
@@ -535,7 +654,7 @@ TEST(replay_matches_live_byte_for_byte) {
         p.close();
     }
     Metrics replayed;
-    CHECK_EQ(runReplay(market.string(), (dir / "replay").string(), replayed), 0);
+    CHECK_EQ(runReplay(replayConfig(market, dir / "replay"), replayed), 0);
     std::string liveBook = readFile(book);
     std::string replayBook = readFile(dir / "replay" / book.filename());
     CHECK(!liveBook.empty());
@@ -543,16 +662,82 @@ TEST(replay_matches_live_byte_for_byte) {
     CHECK_EQ(replayed.bookRows, live.bookRows);
     CHECK_EQ(live.gaps, 1u);
     CHECK_EQ(live.epochResets, 1u);
-    int resets = 0;
-    for (const auto& row : readLines(book)) resets += col(row, 4) == "R";
-    CHECK_EQ(resets, 2);
+    CHECK_EQ(countRows(book, 'R'), 2);
+}
+
+TEST(replay_puts_rest_snapshots_back) {
+    fs::path dir = freshDir("replay_rest");
+    fs::path market = dir / "market_data_spot_BTCUSDT_2026-01-01.csv";
+    fs::path book = dir / "market_data_spot_BTCUSDT_2026-01-01_orderbook.csv";
+    fs::path snapshots = dir / "market_data_spot_BTCUSDT_2026-01-01_snapshots.csv";
+    const JsonLevels deepB = {{"100.00", "1"}, {"99.00", "1"}, {"98.00", "1"}, {"97.00", "1"}, {"96.00", "1"},
+                              {"95.00", "1"},  {"94.00", "1"}};
+    const JsonLevels deepA = {{"101.00", "1"}, {"102.00", "1"}, {"103.00", "1"}, {"104.00", "1"},
+                              {"105.00", "1"}, {"106.00", "1"}, {"107.00", "1"}};
+    Metrics live;
+    int requests = 0;
+    {
+        SymbolPipeline p(Venue::Spot, SeedMode::Rest, "BTCUSDT", live);
+        CHECK(p.open(market.string(), book.string(), snapshots.string()));
+        p.setSnapshotRequester([&](SymbolPipeline&) { requests++; });
+        Router r(Venue::Spot, live);
+        r.add(p);
+        uint64_t seq = 0;
+        int64_t t = T0;
+        auto feed = [&](uint64_t epoch, const std::string& frame) { r.onMessage(0, epoch, seq++, t += 1000, frame); };
+        auto answer = [&](uint64_t id) {  // what the REST client does with a response
+            std::string body = restJson(id, deepB, deepA);
+            RestSnapshot snap;
+            CHECK(decodeRestJson(body, snap) == DecodeError::None);
+            p.onRestSnapshot(t += 500, 1000, body, snap);
+        };
+        feed(0, depth5Frame(100, BIDS5, ASKS5));                  // waiting for REST -> ignored
+        feed(0, diffFrame(95, 101, {{"99.00", "2"}}, {}));        // buffered, asks for a snapshot
+        feed(0, diffFrame(102, 104, {{"100.50", "1"}}, {}));      // buffered, request already out
+        CHECK_EQ(requests, 1);
+        answer(103);                                              // seeds, 102..104 applied on top
+        CHECK(p.sync().live());
+        feed(0, tradeFrame("100.50", "0.2", true));
+        feed(0, depth5Frame(104, {{"100.50", "1"}, {"100.00", "1"}, {"99.00", "1"}, {"98.00", "1"}, {"97.00", "1"}},
+                            ASKS5));                              // matches the book
+        feed(0, diffFrame(200, 201, {}, {}));                     // gap -> R row, asks again
+        CHECK_EQ(requests, 2);
+        answer(150);                                              // older than the buffer -> asks again
+        CHECK_EQ(requests, 3);
+        answer(201);
+        feed(1, diffFrame(300, 301, {}, {}));                     // reconnect -> R row, asks again
+        CHECK_EQ(requests, 4);
+        answer(300);
+        feed(1, diffFrame(302, 302, {{"99.99", "0.00000001"}}, {}));
+        p.close();
+    }
+    CHECK_EQ(live.seeds, 3u);
+    CHECK_EQ(live.seedFailures, 1u);
+    CHECK_EQ(live.levelsMismatched, 0u);
+    CHECK_EQ(countRows(book, 'S'), 3);
+    CHECK_EQ(countRows(book, 'R'), 2);
+    CHECK_EQ(readLines(snapshots).size(), 5u);  // header + 4 answers
+    CHECK_EQ(readLines(market).size(), 9u);     // header + the 8 websocket messages, nothing else
+
+    Metrics replayed;
+    CHECK_EQ(runReplay(replayConfig(market, dir / "replay"), replayed), 0);
+    CHECK(readFile(book) == readFile(dir / "replay" / book.filename()));
+    CHECK_EQ(replayed.seeds, 3u);
+
+    // same capture replayed with depth5 seeding instead gives a different book file
+    Config viaDepth5 = replayConfig(market, dir / "replay_depth5");
+    viaDepth5.seedMode = SeedMode::Depth5;
+    viaDepth5.seedModeGiven = true;
+    Metrics other;
+    CHECK_EQ(runReplay(viaDepth5, other), 0);
+    CHECK(readFile(book) != readFile(dir / "replay_depth5" / book.filename()));
 }
 
 TEST(steady_state_does_not_allocate) {
     fs::path dir = freshDir("alloc");
     Metrics m;
-    SymbolPipeline p(Venue::Spot, "BTCUSDT", m);
-    CHECK(p.open((dir / "md.csv").string(), (dir / "ob.csv").string()));
+    SymbolPipeline p(Venue::Spot, SeedMode::Depth5, "BTCUSDT", m);
+    CHECK(p.open((dir / "md.csv").string(), (dir / "ob.csv").string(), ""));
     Router r(Venue::Spot, m);
     r.add(p);
 
@@ -597,6 +782,25 @@ TEST(cli_parsing_and_limits) {
     const char* bad[] = {"binance_capture", "--symbols", "BTCUSDT", "--symbols-per-shard", "500"};
     CHECK(parseArgs(5, bad, badCfg, err) == ParseResult::Error);
 
+    Config defaults;
+    const char* plain[] = {"binance_capture", "--symbols", "BTCUSDT"};
+    CHECK(parseArgs(3, plain, defaults, err) == ParseResult::Run);
+    CHECK(defaults.seedMode == SeedMode::Rest);
+    CHECK_EQ(defaults.snapshotDepth, 5000);
+
+    Config usdm;  // --snapshot-depth is checked against --venue even when it comes first
+    const char* depth[] = {"binance_capture", "--snapshot-depth", "500", "--venue", "usdm", "--symbols", "BTCUSDT",
+                           "--snapshot", "depth5"};
+    CHECK(parseArgs(9, depth, usdm, err) == ParseResult::Run);
+    CHECK(usdm.seedMode == SeedMode::Depth5);
+    CHECK_EQ(usdm.snapshotDepth, 500);
+    Config tooDeep;
+    const char* deep[] = {"binance_capture", "--venue", "usdm", "--symbols", "BTCUSDT", "--snapshot-depth", "5000"};
+    CHECK(parseArgs(7, deep, tooDeep, err) == ParseResult::Error);
+    CHECK_EQ(snapshotWeight(Venue::Spot, 5000), 250);
+    CHECK_EQ(snapshotWeight(Venue::Spot, 1000), 50);
+    CHECK_EQ(snapshotWeight(Venue::UsdM, 1000), 20);
+
     Endpoint ep;
     CHECK(parseWsUrl("wss://stream.binance.com:443/stream", ep, err));
     CHECK_EQ(ep.port, std::string("443"));
@@ -611,6 +815,8 @@ TEST(cli_parsing_and_limits) {
 }
 
 int main() {
+    // several tests feed in bad frames on purpose, keep the warnings about them out of the output
+    setLogLevel(LogLevel::Error);
     int failedTests = 0;
     for (const TestCase& t : allTests()) {
         int before = failures;

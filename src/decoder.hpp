@@ -28,6 +28,14 @@ struct Depth5 {
     int nAsks = 0;
 };
 
+// REST depth snapshot, same shape on both venues:
+// {"lastUpdateId":..,"bids":[..],"asks":[..]} (futures also sends E and T, not needed)
+struct RestSnapshot {
+    uint64_t lastId = 0;
+    std::vector<Level> bids;  // best first, reused between snapshots
+    std::vector<Level> asks;
+};
+
 struct Trade {
     int64_t price = 0;
     int64_t qty = 0;
@@ -51,6 +59,7 @@ constexpr const char* toString(DecodeError e) {
 // each of these walks the payload's fields once, in order
 DecodeError decodeDiff(simdjson::ondemand::object& obj, Venue venue, DepthDiff& out);
 DecodeError decodeDepth5(simdjson::ondemand::object& obj, Venue venue, Depth5& out);
+DecodeError decodeRestSnapshot(simdjson::ondemand::object& obj, RestSnapshot& out);
 DecodeError decodeTrade(simdjson::ondemand::object& obj, Trade& out);
 
 }  // namespace capture

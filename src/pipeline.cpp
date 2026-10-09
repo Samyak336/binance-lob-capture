@@ -28,20 +28,21 @@ int32_t instrumentId(Venue venue, std::string_view symbol) {
     return static_cast<int32_t>(h & 0x7fffffffu);
 }
 
-SymbolPipeline::SymbolPipeline(Venue venue, std::string symbol, Metrics& metrics)
+SymbolPipeline::SymbolPipeline(Venue venue, SeedMode seedMode, std::string symbol, Metrics& metrics)
     : venue_(venue),
       symbol_(std::move(symbol)),
       streamName_(symbol_),
       id_(instrumentId(venue, symbol_)),
       metrics_(metrics),
-      sync_(venue, metrics) {
+      sync_(venue, seedMode, metrics) {
     for (char& c : streamName_) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     diff_.bids.reserve(1024);
     diff_.asks.reserve(1024);
 }
 
-bool SymbolPipeline::open(const std::string& marketPath, const std::string& bookPath) {
+bool SymbolPipeline::open(const std::string& marketPath, const std::string& bookPath, const std::string& snapshotPath) {
     if (!marketPath.empty() && !marketCsv_.open(marketPath, MARKET_HEADER)) return false;
+    if (!snapshotPath.empty() && !snapshotCsv_.open(snapshotPath, SNAPSHOT_HEADER)) return false;
     return bookCsv_.open(bookPath, BOOK_HEADER);
 }
 
@@ -51,26 +52,56 @@ void SymbolPipeline::onMessage(const MessageMeta& meta, std::string_view payload
 }
 
 void SymbolPipeline::process(const MessageMeta& meta, simdjson::ondemand::object& obj) {
-    if (sync_.onEpoch(meta.connEpoch) == BookEffect::Reset) writeBookRow(meta, ROW_RESET, 'N');
+    last_ = meta;
+    if (sync_.onEpoch(meta.connEpoch) == BookEffect::Reset) writeBookRow(meta.recvSec, meta.recvNsec, ROW_RESET, 'N');
 
     if (meta.kind == StreamKind::DepthDiff) {
         DecodeError err = decodeDiff(obj, venue_, diff_);
         if (err != DecodeError::None) return decodeFailed(meta, err);
         BookEffect fx = sync_.onDiff(diff_);
-        if (fx == BookEffect::Applied) writeBookRow(meta, ROW_DIFF, diffSide(diff_));
-        else if (fx == BookEffect::Reset) writeBookRow(meta, ROW_RESET, 'N');
+        if (fx == BookEffect::Applied) writeBookRow(meta.recvSec, meta.recvNsec, ROW_DIFF, diffSide(diff_));
+        else if (fx == BookEffect::Reset) writeBookRow(meta.recvSec, meta.recvNsec, ROW_RESET, 'N');
+        maybeRequestSnapshot();
     } else if (meta.kind == StreamKind::Depth5) {
         DecodeError err = decodeDepth5(obj, venue_, depth5_);
         if (err != DecodeError::None) return decodeFailed(meta, err);
-        if (sync_.onDepth5(depth5_) == BookEffect::Applied) writeBookRow(meta, ROW_DEPTH5, 'N');
+        if (sync_.onDepth5(depth5_) == BookEffect::Applied) writeBookRow(meta.recvSec, meta.recvNsec, ROW_DEPTH5, 'N');
     } else {
         DecodeError err = decodeTrade(obj, trade_);
         if (err != DecodeError::None) return decodeFailed(meta, err);
         metrics_.trades++;
         // side = which side of the book got hit. buyer is maker means a resting
         // bid was hit by a seller -> 'B'
-        if (sync_.live()) writeBookRow(meta, ROW_TRADE, trade_.buyerIsMaker ? 'B' : 'S');
+        if (sync_.live()) writeBookRow(meta.recvSec, meta.recvNsec, ROW_TRADE, trade_.buyerIsMaker ? 'B' : 'S');
     }
+}
+
+void SymbolPipeline::onRestSnapshot(int64_t recvNs, int depthLimit, std::string_view payload,
+                                    const RestSnapshot& snap) {
+    snapshotRequested_ = false;
+    SnapshotMeta meta;
+    meta.recvSec = recvNs / 1'000'000'000;
+    meta.recvNsec = static_cast<int32_t>(recvNs % 1'000'000'000);
+    meta.shardId = last_.shardId;
+    meta.connEpoch = last_.connEpoch;
+    meta.afterConnSeq = last_.connSeq;
+    meta.depthLimit = depthLimit;
+    writeSnapshotRow(meta, payload);
+    processRestSnapshot(meta, snap);
+}
+
+void SymbolPipeline::processRestSnapshot(const SnapshotMeta& meta, const RestSnapshot& snap) {
+    metrics_.snapshotsReceived++;
+    if (sync_.onRestSnapshot(snap, meta.depthLimit) == BookEffect::Applied)
+        writeBookRow(meta.recvSec, meta.recvNsec, ROW_REST, 'N');
+    // if it was older than the buffered diffs we need another one (binance docs: "go back to step 3")
+    maybeRequestSnapshot();
+}
+
+void SymbolPipeline::maybeRequestSnapshot() {
+    if (!requester_ || snapshotRequested_ || !sync_.needsSnapshot()) return;
+    snapshotRequested_ = true;
+    requester_(*this);
 }
 
 void SymbolPipeline::writeMarketRow(const MessageMeta& meta, std::string_view payload) {
@@ -97,11 +128,35 @@ void SymbolPipeline::writeMarketRow(const MessageMeta& meta, std::string_view pa
     metrics_.marketRows++;
 }
 
-void SymbolPipeline::writeBookRow(const MessageMeta& meta, char type, char side) {
-    OutBuffer& out = bookCsv_.row();
+void SymbolPipeline::writeSnapshotRow(const SnapshotMeta& meta, std::string_view payload) {
+    if (!snapshotCsv_.isOpen()) return;
+    OutBuffer& out = snapshotCsv_.row();
     out.appendInt(meta.recvSec);
     out.push(',');
     out.appendInt(meta.recvNsec);
+    out.push(',');
+    out.append(toString(venue_));
+    out.push(',');
+    out.appendUint(meta.shardId);
+    out.push(',');
+    out.appendUint(meta.connEpoch);
+    out.push(',');
+    out.appendUint(meta.afterConnSeq);
+    out.push(',');
+    out.append(symbol_);
+    out.push(',');
+    out.appendInt(meta.depthLimit);
+    out.push(',');
+    appendCsvField(out, payload);
+    snapshotCsv_.endRow();
+    snapshotCsv_.flush();  // rare and big, no point keeping it in memory
+}
+
+void SymbolPipeline::writeBookRow(int64_t sec, int32_t nsec, char type, char side) {
+    OutBuffer& out = bookCsv_.row();
+    out.appendInt(sec);
+    out.push(',');
+    out.appendInt(nsec);
     out.push(',');
     out.appendUint(++seqNo_);
     out.push(',');
@@ -141,7 +196,8 @@ void SymbolPipeline::flush() {
 void SymbolPipeline::close() {
     marketCsv_.close();
     bookCsv_.close();
-    metrics_.writeErrors += marketCsv_.writeErrors() + bookCsv_.writeErrors();
+    snapshotCsv_.close();
+    metrics_.writeErrors += marketCsv_.writeErrors() + bookCsv_.writeErrors() + snapshotCsv_.writeErrors();
 }
 
 }  // namespace capture

@@ -29,9 +29,17 @@ struct Config {
     int durationSec = 0;  // 0 = until ctrl+c
     int symbolsPerShard = 100;
     int statsIntervalSec = 10;
+    SeedMode seedMode = SeedMode::Rest;
+    bool seedModeGiven = false;  // replay picks the mode from the files unless told
+    int snapshotDepth = 0;       // REST limit=, parseArgs fills in the venue default
     std::string wsUrl;  // optional endpoint override
     std::string replayFile;
 };
+
+// REST depth snapshot settings per venue (see binance's rate limit docs)
+int defaultSnapshotDepth(Venue venue);           // spot 5000, usdm 1000
+bool validSnapshotDepth(Venue venue, int depth);  // spot 1..5000, usdm 5/10/20/50/100/500/1000
+int snapshotWeight(Venue venue, int depth);      // request weight binance charges for it
 
 enum class ParseResult { Run, Help, Version, Error };
 
