@@ -1,73 +1,85 @@
 #include "book_sync.hpp"
 
+#include <utility>
+
 namespace capture {
 
-BookSync::BookSync(Venue venue, SeedMode seedMode, Metrics& metrics)
-    : venue_(venue), seedMode_(seedMode), metrics_(metrics), ring_(MAX_BUFFERED) {}
+static char diffSide(const DepthDiff& d) {
+    if (!d.bids.empty() && d.asks.empty()) return 'B';
+    if (d.bids.empty() && !d.asks.empty()) return 'S';
+    return 'N';
+}
 
-BookEffect BookSync::onEpoch(uint64_t epoch) {
-    if (haveEpoch_ && epoch == epoch_) return BookEffect::None;
+BookSync::BookSync(Venue venue, SeedMode seedMode, Metrics& metrics, Listener listener)
+    : venue_(venue), seedMode_(seedMode), metrics_(metrics), listener_(std::move(listener)), ring_(MAX_BUFFERED) {}
+
+void BookSync::onEpoch(uint64_t epoch) {
+    if (haveEpoch_ && epoch == epoch_) return;
     bool firstConnection = !haveEpoch_;
     haveEpoch_ = true;
     epoch_ = epoch;
-    if (firstConnection) return BookEffect::None;
+    if (firstConnection) return;
 
     // new connection - no idea what we missed while disconnected, start over
     metrics_.epochResets++;
     bool wasLive = live_;
-    dropBook();
-    return wasLive ? BookEffect::Reset : BookEffect::None;
+    dropBook(false);
+    if (wasLive) changed(BookChange::Reset);
 }
 
-BookEffect BookSync::onDiff(const DepthDiff& diff) {
+void BookSync::onDiff(const DepthDiff& diff) {
     if (!live_) {
         bufferDiff(diff);
-        return BookEffect::None;
+        return;
     }
-    DiffResult r = apply(diff);
-    if (r == DiffResult::Applied) return BookEffect::Applied;
-    if (r == DiffResult::Stale) return BookEffect::None;
+    if (apply(diff) != DiffResult::Gap) return;
 
     metrics_.gaps++;
-    dropBook();
+    dropBook(false);
+    changed(BookChange::Reset);
     bufferDiff(diff);  // the next snapshot might still connect to this one
-    return BookEffect::Reset;
 }
 
-BookEffect BookSync::onDepth5(const Depth5& snap) {
+void BookSync::onDepth5(const Depth5& snap) {
     if (!live_) {
         if (seedMode_ == SeedMode::Rest) {  // only the REST snapshot starts the book, depth5 just checks it later
             metrics_.depth5Ignored++;
-            return BookEffect::None;
+            return;
         }
-        bool ok = seed(snap.lastId, snap.bids.data(), snap.nBids, snap.asks.data(), snap.nAsks, TOP_N);
-        return ok ? BookEffect::Applied : BookEffect::None;
+        seed(snap.lastId, snap.bids.data(), snap.nBids, snap.asks.data(), snap.nAsks, TOP_N, BookChange::Depth5);
+        return;
     }
 
     if (snap.lastId == lastId_) {
         refresh(snap, nullptr);
-        return BookEffect::Applied;
+        changed(BookChange::Depth5);
+        return;
     }
     if (snap.lastId < lastId_) {
         metrics_.depth5Stale++;
-        return BookEffect::None;
+        return;
     }
     // ahead of the diffs: keep it until the diff that covers its id shows up
     if (hasPending_) metrics_.depth5Superseded++;
     pending_ = snap;
     hasPending_ = true;
-    return BookEffect::None;
 }
 
-BookEffect BookSync::onRestSnapshot(const RestSnapshot& snap, int depthLimit) {
+void BookSync::onRestSnapshot(const RestSnapshot& snap, int depthLimit) {
     // we only ask for one while the book isn't live, so this would be a late answer
     if (live_) {
         metrics_.snapshotsUnused++;
-        return BookEffect::None;
+        return;
     }
-    bool ok = seed(snap.lastId, snap.bids.data(), static_cast<int>(snap.bids.size()), snap.asks.data(),
-                   static_cast<int>(snap.asks.size()), depthLimit);
-    return ok ? BookEffect::Applied : BookEffect::None;
+    seed(snap.lastId, snap.bids.data(), static_cast<int>(snap.bids.size()), snap.asks.data(),
+         static_cast<int>(snap.asks.size()), depthLimit, BookChange::RestSeed);
+}
+
+// does this diff carry on from update id `last`? right after a snapshot a futures
+// diff only has to straddle it (pu <= last < u)
+bool BookSync::continues(const DepthDiff& diff, uint64_t last, bool afterSnapshot) const {
+    if (venue_ == Venue::Spot) return diff.firstId <= last + 1;
+    return afterSnapshot ? diff.prevLastId <= last : diff.prevLastId == last;
 }
 
 BookSync::DiffResult BookSync::apply(const DepthDiff& diff) {
@@ -75,20 +87,17 @@ BookSync::DiffResult BookSync::apply(const DepthDiff& diff) {
         metrics_.diffsStale++;
         return DiffResult::Stale;
     }
-    bool continuous;
-    if (venue_ == Venue::Spot)
-        continuous = diff.firstId <= lastId_ + 1;
-    else
-        continuous = justSeeded_ ? diff.prevLastId <= lastId_ : diff.prevLastId == lastId_;
-    if (!continuous) return DiffResult::Gap;
+    if (!continues(diff, lastId_, justSeeded_)) return DiffResult::Gap;
 
     // A held depth5 with id L in (last_u, u] is a state somewhere inside this
     // diff. Put it on the book first, then apply the diff: every level the diff
     // touches ends up at its value as of u, and the levels it doesn't touch
     // didn't change between L and u, so the snapshot values are already right.
+    // It gets its own row in between: the top 5 as of L.
     if (hasPending_ && pending_.lastId <= diff.lastId) {
         refresh(pending_, &diff);
         hasPending_ = false;
+        changed(BookChange::Depth5);
     }
 
     for (const Level& l : diff.bids) book_.bids().set(l.price, l.qty);
@@ -96,6 +105,7 @@ BookSync::DiffResult BookSync::apply(const DepthDiff& diff) {
     lastId_ = diff.lastId;
     justSeeded_ = false;
     metrics_.diffsApplied++;
+    changed(BookChange::Diff, diffSide(diff));
     return DiffResult::Applied;
 }
 
@@ -108,7 +118,20 @@ void BookSync::refresh(const Depth5& snap, const DepthDiff* nextDiff) {
 }
 
 // same steps for a depth5 (depth 5) and a REST snapshot (depth = its limit)
-bool BookSync::seed(uint64_t lastId, const Level* bids, int nBids, const Level* asks, int nAsks, int depth) {
+void BookSync::seed(uint64_t lastId, const Level* bids, int nBids, const Level* asks, int nAsks, int depth,
+                    BookChange change) {
+    // buffered diffs the snapshot already covers are dropped. the first one left has
+    // to connect to it, otherwise the snapshot is older than the buffer: keep the
+    // buffer and wait for a newer snapshot
+    while (ringSize_ > 0 && ring_[static_cast<size_t>(ringHead_)].lastId <= lastId) {
+        metrics_.diffsStale++;
+        popBuffered();
+    }
+    if (ringSize_ > 0 && !continues(ring_[static_cast<size_t>(ringHead_)], lastId, true)) {
+        metrics_.seedFailures++;
+        return;
+    }
+
     book_.clear();
     book_.bids().replaceTop(bids, nBids, depth, nullptr);
     book_.asks().replaceTop(asks, nAsks, depth, nullptr);
@@ -116,31 +139,29 @@ bool BookSync::seed(uint64_t lastId, const Level* bids, int nBids, const Level* 
     live_ = true;
     justSeeded_ = true;
     hasPending_ = false;
+    metrics_.seeds++;
+    changed(change);
 
-    // replay whatever came in while we were waiting. anything the snapshot
-    // already covers comes back as Stale and just gets dropped
+    // then the rest of the buffer on top, each diff with its own row
     while (ringSize_ > 0) {
         if (apply(ring_[static_cast<size_t>(ringHead_)]) == DiffResult::Gap) {
-            // snapshot is older than the buffered diffs and doesn't connect -
-            // keep them and wait for a newer snapshot
-            metrics_.seedFailures++;
-            live_ = false;
-            justSeeded_ = false;
-            book_.clear();
-            return false;
+            // can't happen with diffs from one connection, but if the buffer has a
+            // hole it's a gap like any other. what's left of the buffer stays for the next snapshot
+            metrics_.gaps++;
+            dropBook(true);
+            changed(BookChange::Reset);
+            return;
         }
         popBuffered();
     }
-    metrics_.seeds++;
-    return true;
 }
 
-void BookSync::dropBook() {
+void BookSync::dropBook(bool keepBuffer) {
     live_ = false;
     justSeeded_ = false;
     hasPending_ = false;
     book_.clear();
-    ringSize_ = 0;
+    if (!keepBuffer) ringSize_ = 0;
 }
 
 void BookSync::bufferDiff(const DepthDiff& diff) {

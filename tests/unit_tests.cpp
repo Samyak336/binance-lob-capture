@@ -116,6 +116,23 @@ static Config replayConfig(const fs::path& market, const fs::path& outDir) {
     return cfg;
 }
 
+// a BookSync whose changes get written down as order book row letters, e.g. "S D D"
+struct Recorded {
+    Metrics m;
+    std::string rows;
+    BookSync s;
+
+    Recorded(Venue venue, SeedMode mode)
+        : s(venue, mode, m, [this](BookChange change, char) {
+              if (!rows.empty()) rows += ' ';
+              rows += rowType(change);
+          }) {}
+    Recorded(const Recorded&) = delete;
+
+    // the rows since the last call
+    std::string take() { return std::exchange(rows, std::string()); }
+};
+
 static DepthDiff makeDiff(uint64_t first, uint64_t last, std::vector<Level> bids, std::vector<Level> asks,
                           uint64_t prev = 0) {
     DepthDiff d;
@@ -391,165 +408,209 @@ TEST(book_trims_far_levels) {
 // ---- sync logic, spot
 
 TEST(spot_seeds_from_depth5_and_detects_gaps) {
-    Metrics m;
-    BookSync s(Venue::Spot, SeedMode::Depth5, m);
+    Recorded t(Venue::Spot, SeedMode::Depth5);
+    BookSync& s = t.s;
     s.onEpoch(0);
-    CHECK(s.onDiff(makeDiff(90, 95, {{100, 9}}, {})) == BookEffect::None);  // not live yet, buffered
-    CHECK(s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101))) == BookEffect::Applied);
+    s.onDiff(makeDiff(90, 95, {{100, 9}}, {}));  // not live yet, buffered
+    CHECK_EQ(t.take(), "");
+    s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101)));
+    CHECK_EQ(t.take(), "P");
     CHECK(s.live());
-    CHECK_EQ(m.diffsStale, 1u);  // buffered diff was older than the snapshot
+    CHECK_EQ(t.m.diffsStale, 1u);  // buffered diff was older than the snapshot
     CHECK_EQ(s.book().bids().best(0).qty, 1);
-    CHECK(s.onDiff(makeDiff(96, 100, {}, {})) == BookEffect::None);  // already covered
-    CHECK(s.onDiff(makeDiff(101, 103, {{100, 0}}, {})) == BookEffect::Applied);
+    s.onDiff(makeDiff(96, 100, {}, {}));  // already covered
+    CHECK_EQ(t.take(), "");
+    s.onDiff(makeDiff(101, 103, {{100, 0}}, {}));
+    CHECK_EQ(t.take(), "D");
     CHECK_EQ(s.book().bids().best(0).price, 99);
-    CHECK(s.onDiff(makeDiff(110, 112, {}, {})) == BookEffect::Reset);  // 104..109 missing
+    s.onDiff(makeDiff(110, 112, {}, {}));  // 104..109 missing
+    CHECK_EQ(t.take(), "R");
     CHECK(!s.live());
-    CHECK_EQ(m.gaps, 1u);
+    CHECK_EQ(t.m.gaps, 1u);
     CHECK_EQ(s.book().bids().size(), 0);
 }
 
 TEST(spot_replays_buffered_diffs_newer_than_seed) {
-    Metrics m;
-    BookSync s(Venue::Spot, SeedMode::Depth5, m);
+    Recorded t(Venue::Spot, SeedMode::Depth5);
+    BookSync& s = t.s;
     s.onEpoch(0);
     s.onDiff(makeDiff(95, 100, {}, {}));
     s.onDiff(makeDiff(101, 104, {{100, 7}}, {}));
-    CHECK(s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101))) == BookEffect::Applied);
+    s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101)));
+    CHECK_EQ(t.take(), "P D");  // the seed, then the buffered diff on top with its own row
     CHECK_EQ(s.lastUpdateId(), 104u);
     CHECK_EQ(s.book().bids().best(0).qty, 7);
 }
 
 TEST(spot_seed_waits_if_snapshot_too_old) {
-    Metrics m;
-    BookSync s(Venue::Spot, SeedMode::Depth5, m);
+    Recorded t(Venue::Spot, SeedMode::Depth5);
+    BookSync& s = t.s;
     s.onEpoch(0);
     s.onDiff(makeDiff(105, 110, {{100, 3}}, {}));
-    CHECK(s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101))) == BookEffect::None);  // 101..104 missing
+    s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101)));  // 101..104 missing
+    CHECK_EQ(t.take(), "");
     CHECK(!s.live());
-    CHECK_EQ(m.seedFailures, 1u);
-    CHECK(s.onDepth5(makeDepth5(107, bidsFrom(100), asksFrom(101))) == BookEffect::Applied);
+    CHECK_EQ(t.m.seedFailures, 1u);
+    s.onDepth5(makeDepth5(107, bidsFrom(100), asksFrom(101)));
+    CHECK_EQ(t.take(), "P D");
     CHECK_EQ(s.lastUpdateId(), 110u);
     CHECK_EQ(s.book().bids().best(0).qty, 3);
 }
 
-TEST(depth5_ahead_of_its_diff_gets_applied_with_it) {
-    Metrics m;
-    BookSync s(Venue::Spot, SeedMode::Depth5, m);
+TEST(seed_treats_a_hole_in_the_buffer_as_a_gap) {
+    Recorded t(Venue::Spot, SeedMode::Rest);
+    BookSync& s = t.s;
+    s.onEpoch(0);
+    s.onDiff(makeDiff(101, 101, {{100, 2}}, {}));
+    s.onDiff(makeDiff(105, 105, {}, {}));  // 102..104 never arrived
+    s.onRestSnapshot(makeRest(100, deepBids(100), deepAsks(101)), 1000);
+    CHECK_EQ(t.take(), "S D R");
+    CHECK(!s.live());
+    CHECK_EQ(t.m.gaps, 1u);
+    CHECK(s.needsSnapshot());  // 105 stays buffered for the next snapshot
+    s.onRestSnapshot(makeRest(104, deepBids(100), deepAsks(101)), 1000);
+    CHECK_EQ(t.take(), "S D");
+    CHECK_EQ(s.lastUpdateId(), 105u);
+}
+
+TEST(depth5_ahead_of_its_diff_gets_its_row_just_before_it) {
+    Recorded t(Venue::Spot, SeedMode::Depth5);
+    BookSync& s = t.s;
     s.onEpoch(0);
     s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101)));
+    CHECK_EQ(t.take(), "P");
     // this is the usual order on spot: depth5(L) shows up just before the diff ending at L
-    CHECK(s.onDepth5(makeDepth5(103, {{100, 2}, {99, 1}, {98, 1}, {97, 1}, {96, 1}}, asksFrom(101))) == BookEffect::None);
-    CHECK(s.onDiff(makeDiff(101, 103, {{100, 2}}, {})) == BookEffect::Applied);
-    CHECK_EQ(m.depth5Checks, 1u);
-    CHECK_EQ(m.levelsMismatched, 0u);
+    s.onDepth5(makeDepth5(103, {{100, 2}, {99, 1}, {98, 1}, {97, 1}, {96, 1}}, asksFrom(101)));
+    CHECK_EQ(t.take(), "");  // held
+    s.onDiff(makeDiff(101, 103, {{100, 2}}, {}));
+    CHECK_EQ(t.take(), "P D");  // the depth5's row, then the diff's
+    CHECK_EQ(t.m.depth5Checks, 1u);
+    CHECK_EQ(t.m.levelsMismatched, 0u);
     CHECK_EQ(s.book().bids().best(0).qty, 2);
 }
 
 TEST(depth5_catches_and_fixes_a_wrong_level) {
-    Metrics m;
-    BookSync s(Venue::Spot, SeedMode::Depth5, m);
+    Recorded t(Venue::Spot, SeedMode::Depth5);
+    BookSync& s = t.s;
     s.onEpoch(0);
     s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101)));
     s.onDiff(makeDiff(101, 101, {{100, 5}}, {}));
-    CHECK(s.onDepth5(makeDepth5(101, {{100, 4}, {99, 1}, {98, 1}, {97, 1}, {96, 1}}, asksFrom(101))) == BookEffect::Applied);
-    CHECK_EQ(m.levelsMismatched, 1u);
+    CHECK_EQ(t.take(), "P D");
+    s.onDepth5(makeDepth5(101, {{100, 4}, {99, 1}, {98, 1}, {97, 1}, {96, 1}}, asksFrom(101)));
+    CHECK_EQ(t.take(), "P");
+    CHECK_EQ(t.m.levelsMismatched, 1u);
     CHECK_EQ(s.book().bids().best(0).qty, 4);
-    CHECK(s.onDepth5(makeDepth5(90, bidsFrom(100), asksFrom(101))) == BookEffect::None);
-    CHECK_EQ(m.depth5Stale, 1u);
+    s.onDepth5(makeDepth5(90, bidsFrom(100), asksFrom(101)));
+    CHECK_EQ(t.take(), "");
+    CHECK_EQ(t.m.depth5Stale, 1u);
 }
 
 TEST(new_epoch_resets_the_book) {
-    Metrics m;
-    BookSync s(Venue::Spot, SeedMode::Depth5, m);
-    CHECK(s.onEpoch(0) == BookEffect::None);
+    Recorded t(Venue::Spot, SeedMode::Depth5);
+    BookSync& s = t.s;
+    s.onEpoch(0);
     s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101)));
-    CHECK(s.onEpoch(0) == BookEffect::None);
-    CHECK(s.onEpoch(1) == BookEffect::Reset);
+    s.onEpoch(0);
+    CHECK_EQ(t.take(), "P");  // same connection again: nothing happens
+    s.onEpoch(1);
+    CHECK_EQ(t.take(), "R");
     CHECK(!s.live());
     CHECK_EQ(s.book().asks().size(), 0);
-    CHECK_EQ(m.epochResets, 1u);
+    CHECK_EQ(t.m.epochResets, 1u);
 }
 
 // ---- sync logic, futures
 
 TEST(usdm_chains_on_pu) {
-    Metrics m;
-    BookSync s(Venue::UsdM, SeedMode::Depth5, m);
+    Recorded t(Venue::UsdM, SeedMode::Depth5);
+    BookSync& s = t.s;
     s.onEpoch(0);
     // on futures the depth5 id falls inside a diff's range, here (1000, 1010]
-    CHECK(s.onDepth5(makeDepth5(1005, bidsFrom(100), asksFrom(101))) == BookEffect::Applied);
-    CHECK(s.onDiff(makeDiff(1001, 1010, {{100, 3}}, {}, 1000)) == BookEffect::Applied);
-    CHECK(s.onDiff(makeDiff(1011, 1020, {}, {{101, 0}}, 1010)) == BookEffect::Applied);
+    s.onDepth5(makeDepth5(1005, bidsFrom(100), asksFrom(101)));
+    s.onDiff(makeDiff(1001, 1010, {{100, 3}}, {}, 1000));
+    s.onDiff(makeDiff(1011, 1020, {}, {{101, 0}}, 1010));
+    CHECK_EQ(t.take(), "P D D");
     CHECK_EQ(s.book().bids().best(0).qty, 3);
     CHECK_EQ(s.book().asks().best(0).price, 102);
-    CHECK(s.onDiff(makeDiff(1031, 1040, {}, {}, 1025)) == BookEffect::Reset);  // pu != last u
-    CHECK_EQ(m.gaps, 1u);
+    s.onDiff(makeDiff(1031, 1040, {}, {}, 1025));  // pu != last u
+    CHECK_EQ(t.take(), "R");
+    CHECK_EQ(t.m.gaps, 1u);
 }
 
 TEST(usdm_depth5_inside_next_diff_is_checked_against_it) {
-    Metrics m;
-    BookSync s(Venue::UsdM, SeedMode::Depth5, m);
+    Recorded t(Venue::UsdM, SeedMode::Depth5);
+    BookSync& s = t.s;
     s.onEpoch(0);
     s.onDepth5(makeDepth5(1005, bidsFrom(100), asksFrom(101)));
     s.onDiff(makeDiff(1001, 1010, {}, {}, 1000));
+    CHECK_EQ(t.take(), "P D");
     // snapshot at 1015 already shows bid 100 = 8, which the next diff (1011..1020) sets - not a mismatch
-    CHECK(s.onDepth5(makeDepth5(1015, {{100, 8}, {99, 1}, {98, 1}, {97, 1}, {96, 1}}, asksFrom(101))) == BookEffect::None);
-    CHECK(s.onDiff(makeDiff(1011, 1020, {{100, 8}}, {}, 1010)) == BookEffect::Applied);
-    CHECK_EQ(m.depth5Checks, 1u);
-    CHECK_EQ(m.levelsMismatched, 0u);
+    s.onDepth5(makeDepth5(1015, {{100, 8}, {99, 1}, {98, 1}, {97, 1}, {96, 1}}, asksFrom(101)));
+    CHECK_EQ(t.take(), "");
+    s.onDiff(makeDiff(1011, 1020, {{100, 8}}, {}, 1010));
+    CHECK_EQ(t.take(), "P D");
+    CHECK_EQ(t.m.depth5Checks, 1u);
+    CHECK_EQ(t.m.levelsMismatched, 0u);
 }
 
 // ---- sync logic, REST snapshots (the default)
 
 TEST(rest_seed_follows_binance_procedure) {
-    Metrics m;
-    BookSync s(Venue::Spot, SeedMode::Rest, m);
+    Recorded t(Venue::Spot, SeedMode::Rest);
+    BookSync& s = t.s;
     s.onEpoch(0);
     CHECK(!s.needsSnapshot());
-    CHECK(s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101))) == BookEffect::None);  // can't start the book
-    CHECK_EQ(m.depth5Ignored, 1u);
-    CHECK(s.onDiff(makeDiff(95, 101, {{100, 4}}, {})) == BookEffect::None);
+    s.onDepth5(makeDepth5(100, bidsFrom(100), asksFrom(101)));  // can't start the book
+    CHECK_EQ(t.m.depth5Ignored, 1u);
+    s.onDiff(makeDiff(95, 101, {{100, 4}}, {}));
     CHECK(s.needsSnapshot());
     s.onDiff(makeDiff(102, 104, {{99, 0}}, {}));
-    // first buffered diff ends before 103 -> dropped, second one has U <= 103+1 -> applied
-    CHECK(s.onRestSnapshot(makeRest(103, deepBids(100), deepAsks(101)), 1000) == BookEffect::Applied);
+    CHECK_EQ(t.take(), "");
+    // first buffered diff ends before 103 -> dropped, second one has U <= 103+1 -> applied, with its own row
+    s.onRestSnapshot(makeRest(103, deepBids(100), deepAsks(101)), 1000);
+    CHECK_EQ(t.take(), "S D");
     CHECK(s.live());
     CHECK(!s.needsSnapshot());
     CHECK_EQ(s.lastUpdateId(), 104u);
-    CHECK_EQ(m.diffsStale, 1u);
+    CHECK_EQ(t.m.diffsStale, 1u);
     CHECK_EQ(s.book().bids().best(1).price, 98);  // 99 removed by the diff
     CHECK(s.book().topVerified());                 // ten levels known, not just five
     // nobody asked for this one
-    CHECK(s.onRestSnapshot(makeRest(104, deepBids(100), deepAsks(101)), 1000) == BookEffect::None);
-    CHECK_EQ(m.snapshotsUnused, 1u);
+    s.onRestSnapshot(makeRest(104, deepBids(100), deepAsks(101)), 1000);
+    CHECK_EQ(t.take(), "");
+    CHECK_EQ(t.m.snapshotsUnused, 1u);
 }
 
 TEST(rest_snapshot_older_than_buffer_is_fetched_again) {
-    Metrics m;
-    BookSync s(Venue::Spot, SeedMode::Rest, m);
+    Recorded t(Venue::Spot, SeedMode::Rest);
+    BookSync& s = t.s;
     s.onEpoch(0);
     s.onDiff(makeDiff(105, 110, {{100, 3}}, {}));
-    CHECK(s.onRestSnapshot(makeRest(100, deepBids(100), deepAsks(101)), 1000) == BookEffect::None);  // 101..104 missing
+    s.onRestSnapshot(makeRest(100, deepBids(100), deepAsks(101)), 1000);  // 101..104 missing
+    CHECK_EQ(t.take(), "");
     CHECK(!s.live());
     CHECK(s.needsSnapshot());
-    CHECK_EQ(m.seedFailures, 1u);
-    CHECK(s.onRestSnapshot(makeRest(107, deepBids(100), deepAsks(101)), 1000) == BookEffect::Applied);
+    CHECK_EQ(t.m.seedFailures, 1u);
+    s.onRestSnapshot(makeRest(107, deepBids(100), deepAsks(101)), 1000);
+    CHECK_EQ(t.take(), "S D");
     CHECK_EQ(s.lastUpdateId(), 110u);
     CHECK_EQ(s.book().bids().best(0).qty, 3);
 }
 
 TEST(usdm_rest_seed_straddles_snapshot_id) {
-    Metrics m;
-    BookSync s(Venue::UsdM, SeedMode::Rest, m);
+    Recorded t(Venue::UsdM, SeedMode::Rest);
+    BookSync& s = t.s;
     s.onEpoch(0);
     s.onDiff(makeDiff(990, 1000, {}, {}, 985));
     s.onDiff(makeDiff(1001, 1010, {{100, 3}}, {}, 1000));
     // futures docs: drop u < lastUpdateId, the first one applied has U <= lastUpdateId <= u
-    CHECK(s.onRestSnapshot(makeRest(1005, deepBids(100), deepAsks(101)), 1000) == BookEffect::Applied);
+    s.onRestSnapshot(makeRest(1005, deepBids(100), deepAsks(101)), 1000);
+    CHECK_EQ(t.take(), "S D");
     CHECK_EQ(s.lastUpdateId(), 1010u);
     CHECK_EQ(s.book().bids().best(0).qty, 3);
-    CHECK(s.onDiff(makeDiff(1011, 1020, {}, {}, 1010)) == BookEffect::Applied);
-    CHECK(s.onDiff(makeDiff(1031, 1040, {}, {}, 1025)) == BookEffect::Reset);  // pu != last u
+    s.onDiff(makeDiff(1011, 1020, {}, {}, 1010));
+    s.onDiff(makeDiff(1031, 1040, {}, {}, 1025));  // pu != last u
+    CHECK_EQ(t.take(), "D R");
     CHECK(s.needsSnapshot());
 }
 
@@ -627,6 +688,34 @@ TEST(router_minifies_payload_with_spaces) {
     CHECK_EQ(m.decodeErrors, 0u);
 }
 
+TEST(held_depth5_row_shows_its_levels_at_the_diffs_time) {
+    fs::path dir = freshDir("held");
+    Metrics m;
+    SymbolPipeline p(Venue::Spot, SeedMode::Depth5, "BTCUSDT", m);
+    CHECK(p.open("", (dir / "ob.csv").string(), ""));
+    Router r(Venue::Spot, m);
+    r.add(p);
+    r.onMessage(0, 0, 0, T0, depth5Frame(100, BIDS5, ASKS5));
+    // ahead of the book: held, no row yet
+    r.onMessage(0, 0, 1, T0 + 1,
+                depth5Frame(101, {{"100.50", "2"}, {"100.00", "1"}, {"99.00", "1"}, {"98.00", "1"}, {"97.00", "1"}}, ASKS5));
+    r.onMessage(0, 0, 2, T0 + 2, tradeFrame("101.00", "0.1", false));
+    r.onMessage(0, 0, 3, T0 + 3, diffFrame(101, 101, {{"100.50", "2"}, {"96.00", "0"}}, {}));
+    p.close();
+
+    auto ob = readLines(dir / "ob.csv");
+    CHECK_EQ(ob.size(), 5u);  // header, P (seed), T, P (the held depth5), D
+    CHECK_EQ(col(ob[3], 4), std::string("P"));
+    CHECK_EQ(col(ob[3], 1), std::string("123456792"));     // written when it's applied, with the diff's time
+    CHECK_EQ(col(ob[3], 6), std::string("10050000000"));   // its best bid
+    CHECK_EQ(col(ob[3], 10), std::string("9700000000"));   // its 5th bid
+    CHECK_EQ(col(ob[3], 11), std::string("200000000"));    // size at its best bid
+    CHECK_EQ(col(ob[4], 4), std::string("D"));
+    CHECK_EQ(col(ob[4], 1), std::string("123456792"));
+    CHECK_EQ(m.depth5Checks, 1u);
+    CHECK_EQ(m.levelsMismatched, 0u);
+}
+
 TEST(replay_matches_live_byte_for_byte) {
     fs::path dir = freshDir("replay");
     fs::path market = dir / "market_data_spot_BTCUSDT_2026-01-01.csv";
@@ -663,6 +752,9 @@ TEST(replay_matches_live_byte_for_byte) {
     CHECK_EQ(live.gaps, 1u);
     CHECK_EQ(live.epochResets, 1u);
     CHECK_EQ(countRows(book, 'R'), 2);
+    // every applied diff and every applied depth5 has its own row
+    CHECK_EQ(countRows(book, 'D'), static_cast<int>(live.diffsApplied));
+    CHECK_EQ(countRows(book, 'P'), static_cast<int>(live.depth5Checks + live.seeds));
 }
 
 TEST(replay_puts_rest_snapshots_back) {
@@ -716,6 +808,8 @@ TEST(replay_puts_rest_snapshots_back) {
     CHECK_EQ(live.levelsMismatched, 0u);
     CHECK_EQ(countRows(book, 'S'), 3);
     CHECK_EQ(countRows(book, 'R'), 2);
+    CHECK_EQ(countRows(book, 'D'), static_cast<int>(live.diffsApplied));
+    CHECK_EQ(countRows(book, 'P'), static_cast<int>(live.depth5Checks));
     CHECK_EQ(readLines(snapshots).size(), 5u);  // header + 4 answers
     CHECK_EQ(readLines(market).size(), 9u);     // header + the 8 websocket messages, nothing else
 

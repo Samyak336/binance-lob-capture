@@ -28,10 +28,20 @@ constexpr std::string_view SNAPSHOT_HEADER =
 
 // values for the `type` column
 constexpr char ROW_DIFF = 'D';   // depthUpdate applied
-constexpr char ROW_DEPTH5 = 'P'; // depth5 seeded or verified the book
+constexpr char ROW_DEPTH5 = 'P'; // depth5 applied (checked + written over the top 5), or seeded the book
 constexpr char ROW_REST = 'S';   // REST snapshot seeded the book
 constexpr char ROW_TRADE = 'T';  // trade, book unchanged (just an annotation)
 constexpr char ROW_RESET = 'R';  // book dropped because of a gap/reconnect, all levels 0
+
+constexpr char rowType(BookChange change) {
+    switch (change) {
+        case BookChange::RestSeed: return ROW_REST;
+        case BookChange::Depth5: return ROW_DEPTH5;
+        case BookChange::Diff: return ROW_DIFF;
+        case BookChange::Reset: return ROW_RESET;
+    }
+    return '?';
+}
 
 // FNV-1a hash of "venue:SYMBOL" with the sign bit cleared. only depends on the
 // instrument, so the live run and the replay always agree on it
@@ -46,6 +56,9 @@ int32_t instrumentId(Venue venue, std::string_view symbol);
 class SymbolPipeline {
 public:
     SymbolPipeline(Venue venue, SeedMode seedMode, std::string symbol, Metrics& metrics);
+    // the book writes its rows through a callback that points back at this object
+    SymbolPipeline(const SymbolPipeline&) = delete;
+    SymbolPipeline& operator=(const SymbolPipeline&) = delete;
 
     // empty path = don't write that file (replay only writes the order book)
     bool open(const std::string& marketPath, const std::string& bookPath, const std::string& snapshotPath);
@@ -72,11 +85,14 @@ public:
     const BookSync& sync() const { return sync_; }
     const std::string& bookPath() const { return bookCsv_.path(); }
     const std::string& marketPath() const { return marketCsv_.path(); }
+    uint64_t writeErrors() const {
+        return marketCsv_.writeErrors() + bookCsv_.writeErrors() + snapshotCsv_.writeErrors();
+    }
 
 private:
     void writeMarketRow(const MessageMeta& meta, std::string_view payload);
     void writeSnapshotRow(const SnapshotMeta& meta, std::string_view payload);
-    void writeBookRow(int64_t sec, int32_t nsec, char type, char side);
+    void writeBookRow(char type, char side);
     void decodeFailed(const MessageMeta& meta, DecodeError err);
     void maybeRequestSnapshot();
 
@@ -90,6 +106,11 @@ private:
     CsvWriter bookCsv_;
     CsvWriter snapshotCsv_{0};  // a few big rows per run, written straight away
     uint64_t seqNo_ = 0;
+
+    // timestamp for the order book rows of the event being processed: the message's
+    // receive time, or the time a REST snapshot arrived
+    int64_t rowSec_ = 0;
+    int32_t rowNsec_ = 0;
 
     MessageMeta last_;  // last market data message, the anchor for REST snapshots
     std::function<void(SymbolPipeline&)> requester_;

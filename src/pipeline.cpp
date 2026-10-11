@@ -8,12 +8,6 @@
 
 namespace capture {
 
-static char diffSide(const DepthDiff& d) {
-    if (!d.bids.empty() && d.asks.empty()) return 'B';
-    if (d.bids.empty() && !d.asks.empty()) return 'S';
-    return 'N';
-}
-
 int32_t instrumentId(Venue venue, std::string_view symbol) {
     uint32_t h = 2166136261u;
     auto mix = [&h](std::string_view s) {
@@ -34,7 +28,8 @@ SymbolPipeline::SymbolPipeline(Venue venue, SeedMode seedMode, std::string symbo
       streamName_(symbol_),
       id_(instrumentId(venue, symbol_)),
       metrics_(metrics),
-      sync_(venue, seedMode, metrics) {
+      // every change to the book gets its row right away, while the book is in that state
+      sync_(venue, seedMode, metrics, [this](BookChange change, char side) { writeBookRow(rowType(change), side); }) {
     for (char& c : streamName_) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     diff_.bids.reserve(1024);
     diff_.asks.reserve(1024);
@@ -53,26 +48,26 @@ void SymbolPipeline::onMessage(const MessageMeta& meta, std::string_view payload
 
 void SymbolPipeline::process(const MessageMeta& meta, simdjson::ondemand::object& obj) {
     last_ = meta;
-    if (sync_.onEpoch(meta.connEpoch) == BookEffect::Reset) writeBookRow(meta.recvSec, meta.recvNsec, ROW_RESET, 'N');
+    rowSec_ = meta.recvSec;  // every row this message causes gets its receive time
+    rowNsec_ = meta.recvNsec;
+    sync_.onEpoch(meta.connEpoch);
 
     if (meta.kind == StreamKind::DepthDiff) {
         DecodeError err = decodeDiff(obj, venue_, diff_);
         if (err != DecodeError::None) return decodeFailed(meta, err);
-        BookEffect fx = sync_.onDiff(diff_);
-        if (fx == BookEffect::Applied) writeBookRow(meta.recvSec, meta.recvNsec, ROW_DIFF, diffSide(diff_));
-        else if (fx == BookEffect::Reset) writeBookRow(meta.recvSec, meta.recvNsec, ROW_RESET, 'N');
+        sync_.onDiff(diff_);
         maybeRequestSnapshot();
     } else if (meta.kind == StreamKind::Depth5) {
         DecodeError err = decodeDepth5(obj, venue_, depth5_);
         if (err != DecodeError::None) return decodeFailed(meta, err);
-        if (sync_.onDepth5(depth5_) == BookEffect::Applied) writeBookRow(meta.recvSec, meta.recvNsec, ROW_DEPTH5, 'N');
+        sync_.onDepth5(depth5_);
     } else {
         DecodeError err = decodeTrade(obj, trade_);
         if (err != DecodeError::None) return decodeFailed(meta, err);
         metrics_.trades++;
         // side = which side of the book got hit. buyer is maker means a resting
         // bid was hit by a seller -> 'B'
-        if (sync_.live()) writeBookRow(meta.recvSec, meta.recvNsec, ROW_TRADE, trade_.buyerIsMaker ? 'B' : 'S');
+        if (sync_.live()) writeBookRow(ROW_TRADE, trade_.buyerIsMaker ? 'B' : 'S');
     }
 }
 
@@ -92,8 +87,9 @@ void SymbolPipeline::onRestSnapshot(int64_t recvNs, int depthLimit, std::string_
 
 void SymbolPipeline::processRestSnapshot(const SnapshotMeta& meta, const RestSnapshot& snap) {
     metrics_.snapshotsReceived++;
-    if (sync_.onRestSnapshot(snap, meta.depthLimit) == BookEffect::Applied)
-        writeBookRow(meta.recvSec, meta.recvNsec, ROW_REST, 'N');
+    rowSec_ = meta.recvSec;  // the S row and the buffered diffs applied with it
+    rowNsec_ = meta.recvNsec;
+    sync_.onRestSnapshot(snap, meta.depthLimit);
     // if it was older than the buffered diffs we need another one (binance docs: "go back to step 3")
     maybeRequestSnapshot();
 }
@@ -152,11 +148,11 @@ void SymbolPipeline::writeSnapshotRow(const SnapshotMeta& meta, std::string_view
     snapshotCsv_.flush();  // rare and big, no point keeping it in memory
 }
 
-void SymbolPipeline::writeBookRow(int64_t sec, int32_t nsec, char type, char side) {
+void SymbolPipeline::writeBookRow(char type, char side) {
     OutBuffer& out = bookCsv_.row();
-    out.appendInt(sec);
+    out.appendInt(rowSec_);
     out.push(',');
-    out.appendInt(nsec);
+    out.appendInt(rowNsec_);
     out.push(',');
     out.appendUint(++seqNo_);
     out.push(',');
