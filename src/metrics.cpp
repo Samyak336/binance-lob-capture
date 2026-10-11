@@ -27,10 +27,11 @@ uint64_t LatencyStats::percentile(double q) const {
 
 void Metrics::print(std::FILE* out, const char* label) const {
     std::fprintf(out,
-                 "[%s] transport: connects=%" PRIu64 " disconnects=%" PRIu64 " messages=%" PRIu64
-                 " bytes=%" PRIu64 " envelope_errors=%" PRIu64 " unknown_streams=%" PRIu64
+                 "[%s] transport: connects=%" PRIu64 " connect_failures=%" PRIu64 " disconnects=%" PRIu64
+                 " messages=%" PRIu64 " bytes=%" PRIu64 " envelope_errors=%" PRIu64 " unknown_streams=%" PRIu64
                  " minified_payloads=%" PRIu64 "\n",
-                 label, connects, disconnects, messages, bytes, envelopeErrors, unknownStreams, minifiedPayloads);
+                 label, connects, connectFailures, disconnects, messages, bytes, envelopeErrors, unknownStreams,
+                 minifiedPayloads);
     std::fprintf(out,
                  "[%s] book: diffs_applied=%" PRIu64 " diffs_stale=%" PRIu64 " diffs_buffered=%" PRIu64
                  " buffer_overflows=%" PRIu64 " gaps=%" PRIu64 " epoch_resets=%" PRIu64 " seeds=%" PRIu64

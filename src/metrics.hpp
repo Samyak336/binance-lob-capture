@@ -26,7 +26,8 @@ private:
 struct Metrics {
     // network
     uint64_t connects = 0;
-    uint64_t disconnects = 0;
+    uint64_t connectFailures = 0;  // attempts that never got as far as the websocket handshake
+    uint64_t disconnects = 0;      // working connections that dropped
     uint64_t messages = 0;
     uint64_t bytes = 0;
     uint64_t envelopeErrors = 0;

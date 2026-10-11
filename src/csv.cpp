@@ -5,6 +5,8 @@
 #include <charconv>
 #include <cstring>
 
+#include "log.hpp"
+
 namespace capture {
 
 OutBuffer::OutBuffer(size_t initialCapacity) {
@@ -86,6 +88,8 @@ bool CsvWriter::flush() {
     size_t written = std::fwrite(data.data(), 1, data.size(), file_.get());
     buf_.clear();
     if (written != data.size()) {
+        // say so straight away (a full disk shouldn't wait for the end of the run), then just count
+        if (writeErrors_ == 0) logMsg(LogLevel::Error, "writing %s failed: %s", path_.c_str(), std::strerror(errno));
         writeErrors_++;
         return false;
     }

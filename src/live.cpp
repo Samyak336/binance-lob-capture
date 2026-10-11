@@ -145,6 +145,7 @@ private:
         if (ec) return fail("websocket handshake", ec);
         if (connectedBefore_) epoch_++;
         connectedBefore_ = true;
+        connected_ = true;
         seq_ = 0;
         backoff_ = FIRST_BACKOFF;
         metrics_.connects++;
@@ -169,7 +170,10 @@ private:
 
     void fail(const char* what, beast::error_code ec) {
         if (stopping_) return;  // errors while shutting down are expected
-        metrics_.disconnects++;
+        // a working connection that dropped, or an attempt that never got that far
+        if (connected_) metrics_.disconnects++;
+        else metrics_.connectFailures++;
+        connected_ = false;
         logMsg(LogLevel::Warn, "shard %u %s failed: %s; reconnecting in %lld ms", id_, what, ec.message().c_str(),
                static_cast<long long>(backoff_.count()));
         if (ws_) beast::get_lowest_layer(*ws_).close();
@@ -200,6 +204,7 @@ private:
     uint64_t epoch_ = 0;
     uint64_t seq_ = 0;
     bool connectedBefore_ = false;
+    bool connected_ = false;
     bool stopping_ = false;
     std::chrono::milliseconds backoff_ = FIRST_BACKOFF;
 };
@@ -342,14 +347,18 @@ int runLive(const Config& cfg, Metrics& metrics) {
         statsTimer.async_wait([&](beast::error_code ec) {
             if (ec) return;
             size_t liveBooks = 0;
-            for (auto& p : pipelines) liveBooks += p->sync().live() ? 1u : 0u;
+            uint64_t writeErrors = 0;
+            for (auto& p : pipelines) {
+                liveBooks += p->sync().live() ? 1u : 0u;
+                writeErrors += p->writeErrors();
+            }
             logMsg(LogLevel::Info,
                    "stats: messages=%" PRIu64 " market_rows=%" PRIu64 " book_rows=%" PRIu64 " live_books=%zu/%zu"
                    " gaps=%" PRIu64 " disconnects=%" PRIu64 " depth5_checks=%" PRIu64 " mismatched=%" PRIu64
-                   " uncertain_rows=%" PRIu64 " p99<=%" PRIu64 "ns",
+                   " uncertain_rows=%" PRIu64 " write_errors=%" PRIu64 " p99<=%" PRIu64 "ns",
                    metrics.messages, metrics.marketRows, metrics.bookRows, liveBooks, pipelines.size(), metrics.gaps,
                    metrics.disconnects, metrics.depth5Checks, metrics.levelsMismatched, metrics.uncertainRows,
-                   metrics.latency.percentile(0.99));
+                   writeErrors, metrics.latency.percentile(0.99));
             scheduleStats();
         });
     };
@@ -360,6 +369,10 @@ int runLive(const Config& cfg, Metrics& metrics) {
 
     for (auto& p : pipelines) p->close();
     for (auto& p : pipelines) logMsg(LogLevel::Info, "closed %s and %s", p->marketPath().c_str(), p->bookPath().c_str());
+    if (metrics.connects == 0) {  // the files only have headers, don't let that look like success
+        logMsg(LogLevel::Error, "never managed to connect to %s:%s", endpoint.host.c_str(), endpoint.port.c_str());
+        return 4;
+    }
     return metrics.writeErrors == 0 ? 0 : 3;
 }
 
