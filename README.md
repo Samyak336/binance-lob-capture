@@ -20,7 +20,11 @@ files I'd look at, and [How I tested it](#how-i-tested-it) has the numbers.
 Ubuntu 22.04, GCC 12.3 (`g++-12`), C++17. It also builds with the default GCC 11.4.
 
 Dependencies: Boost 1.74 (only Asio and Beast, both header-only), OpenSSL 3, and
-simdjson 4.6.11, which CMake downloads itself and checks against a pinned SHA-256.
+simdjson 4.6.11, which CMake downloads itself and checks against a pinned SHA-256. On a
+machine that can't download it, unpack the
+[v4.6.11 release](https://github.com/simdjson/simdjson/archive/refs/tags/v4.6.11.tar.gz)
+somewhere and add `-DFETCHCONTENT_SOURCE_DIR_SIMDJSON=/path/to/simdjson-4.6.11` to the
+first cmake command.
 
 ```bash
 sudo apt-get install -y cmake ninja-build g++-12 libssl-dev libboost-all-dev
@@ -58,7 +62,9 @@ different machine, configure with `-DBLC_MARCH=` (empty).
 Symbols are a comma-separated list with no spaces, in any case (`btcusdt,ETHUSDT`). Each
 one has to be 1-20 letters or digits, duplicates are dropped, and there can be at most 200.
 Ctrl+C, SIGTERM or the end of `--duration` closes the websockets, flushes the files and
-prints the counters.
+prints the counters. The exit code is 0 if everything went fine, 1 if a file couldn't be
+opened or created, 2 for bad arguments, 3 if a write failed (or replay found malformed
+rows), and 4 if it never managed to connect.
 
 | Option | Default | |
 |---|---|---|
@@ -76,9 +82,9 @@ prints the counters.
 Each symbol gets its own files, named after the UTC date the run started:
 
 ```
-output/market_data_spot_BTCUSDT_2026-10-08.csv              every websocket message
-output/market_data_spot_BTCUSDT_2026-10-08_orderbook.csv    top 5 after every event
-output/market_data_spot_BTCUSDT_2026-10-08_snapshots.csv    the REST snapshots, so replay works offline
+output/market_data_spot_BTCUSDT_2026-10-11.csv              every websocket message
+output/market_data_spot_BTCUSDT_2026-10-11_orderbook.csv    top 5 after every event
+output/market_data_spot_BTCUSDT_2026-10-11_snapshots.csv    the REST snapshots, so replay works offline
 ```
 
 The assignment allowed one file per run with a symbol column instead. I went with one set
@@ -126,7 +132,7 @@ tsec,tnsec,seqNo,id,type,side,bid0,bid1,bid2,bid3,bid4,bid_size0,bid_size1,bid_s
 
 | Column | |
 |---|---|
-| `tsec`, `tnsec` | receive time of the message that caused the row, the same value as in its market data row. An `S` row uses the time the REST answer arrived |
+| `tsec`, `tnsec` | receive time of the message that caused the row, the same value as in its market data row. Rows caused by a REST answer (the `S` row and the `D` rows of the buffered diffs applied with it) use the time the answer arrived, and a held depth5's `P` row uses the time of the diff it was applied with, so the column never goes backwards |
 | `seqNo` | 1, 2, 3… per file |
 | `id` | 32-bit FNV-1a hash of `"<venue>:<SYMBOL>"` with the sign bit cleared (spot BTCUSDT is `2014473836`). It only depends on the instrument, so it's the same in every run, in replay, and whatever order the symbols are listed in |
 | `bid0..4`, `ask0..4` | top 5 prices, best first, [scaled](#prices-sizes-and-timestamps). Missing levels are `0` |
@@ -136,13 +142,18 @@ tsec,tnsec,seqNo,id,type,side,bid0,bid1,bid2,bid3,bid4,bid_size0,bid_size1,bid_s
 
 | `type` | written when | `side` |
 |---|---|---|
-| `S` | a REST snapshot started the book (any buffered diffs newer than it are already applied on top) | `N` |
+| `S` | a REST snapshot started the book. The buffered diffs applied on top of it follow as their own `D` rows | `N` |
 | `D` | a depthUpdate was applied | `B` only bids changed, `S` only asks changed, `N` both |
-| `P` | a depth5 was checked against the book at the same update id (or, with `--snapshot depth5`, started it) | `N` |
+| `P` | a depth5 was applied: checked against the book and written over its top 5 (or, with `--snapshot depth5`, used to start the book). The row shows the top 5 as of the depth5's update id | `N` |
 | `T` | a trade came in while the book was live. **The book isn't changed by it**, the row just shows the book at that moment (see [trades](#keeping-the-book-in-sync)) | side of the book that got hit: `m=true` means the buyer was the maker, so a seller hit the bid → `B`; `m=false` → `S` |
 | `R` | the book was thrown away because of a gap or a reconnect. All prices and sizes are `0` | `N` |
 
-While a book is waiting for its snapshot, nothing is written for it.
+So every applied diff has its own `D` row and every applied depth5 its own `P` row, and the
+counters printed at the end say how many of each there should be: `diffs_applied` and
+`checks` (plus `seeds` with `--snapshot depth5`). A depth5 that's older than the book,
+arrives while the book is waiting for its snapshot, or is replaced by a newer one before its
+diff shows up is never applied, so it gets no row; those are counted as `stale`, `ignored`
+and `superseded`. While a book is waiting for its snapshot, nothing is written for it.
 
 ## Prices, sizes and timestamps
 
@@ -172,10 +183,11 @@ This is all in [src/book_sync.cpp](src/book_sync.cpp).
 1. Buffer the diffs coming in on the websocket (up to 256).
 2. When the first one arrives, fetch a REST snapshot: `/api/v3/depth?limit=5000` on spot,
    `/fapi/v1/depth?limit=1000` on USD-M (1000 is the futures maximum).
-3. Drop the buffered diffs it already covers (`u <= lastUpdateId`) and apply the rest on
-   top, with the usual sequence check.
+3. Drop the buffered diffs it already covers (`u <= lastUpdateId`).
 4. If the first remaining diff doesn't connect to the snapshot, the snapshot is older than
    the buffer. Throw it away and fetch another one.
+5. Otherwise start the book from the snapshot (`S` row) and apply the remaining buffered
+   diffs on top, with the usual sequence check, each with its own `D` row.
 
 depth5 messages that arrive while a book is waiting are ignored (counted as `ignored`).
 
@@ -195,9 +207,10 @@ a useful comparison. A depth5 only shows 5 levels, so right after starting the b
 doesn't know anything below them. The book keeps track of how deep it knows the market for
 sure (`verifiedEdge_` in [src/order_book.hpp](src/order_book.hpp)): if the best levels get
 cancelled and a level it has never seen moves into the top 5, the row is counted under
-`uncertain_rows`, and the next depth5 fills in the hole (`levels_learned`). In a 20-second
-depth5-mode run, depth5 showed the book 13 levels it didn't have, and replaying the 2-minute
-sample that way gives 35. With the REST snapshot it has been 0 in every run.
+`uncertain_rows`, and the next depth5 fills in the hole (`levels_learned`). How often that
+happens depends on how busy the market is. On a busy 8 Oct, a 20-second depth5-mode run
+had 13 and a 2-minute capture replayed that way had 35. On the quiet morning of 11 Oct the
+same two numbers were 0 and 2. With the REST snapshot it has been 0 in every run.
 
 **Sequence checks while live.** Every diff has to continue from the last one:
 
@@ -207,7 +220,7 @@ sample that way gives 35. With the REST snapshot it has been 0 in every run.
 - a diff with `u <= last_u` is old and dropped (`diffs_stale`)
 
 If the check fails, it's a gap: the book is thrown away, an `R` row is written, and it
-starts again from step 1. The diff that showed the gap stays in the buffer, since the next
+starts again from the top. The diff that showed the gap stays in the buffer, since the next
 snapshot may well connect to it.
 
 **Reconnects.** A new connection gets a new `conn_epoch`. I can't know what was missed while
@@ -229,8 +242,9 @@ venue and looked at how depth5 lines up with the diffs:
 
 Comparing a depth5 with the book only makes sense at the same update id, so:
 
-- if its id equals the book's, it's checked right away (a `P` row);
-- if it's ahead, it's held and laid on the book right before the diff that covers its id;
+- if its id equals the book's, it's applied right away (a `P` row);
+- if it's ahead, it's held and laid on the book right before the diff that covers its id.
+  Its `P` row comes right before that diff's `D` row;
 - if it's behind, it's ignored (`stale`).
 
 Laying it on early is safe because a diff carries the final quantity, as of `u`, of every
@@ -250,8 +264,9 @@ records the book at the time of the trade.
 **One thread.** One `io_context` runs everything (socket reads, JSON parsing, book updates,
 CSV formatting and the REST client) for all connections. Nothing is shared between threads,
 so there are no locks, atomics or data races to reason about. In my runs BTCUSDT spot
-averaged 90-270 messages per second, most of them trades, and a message takes a few
-microseconds to process (median under 4 µs), so the thread is idle almost all the time.
+averaged between 25 messages per second (a quiet Sunday morning) and 270 (a busy
+afternoon, with bursts above 700), and a message takes a few microseconds to process (a
+median of 2-16 µs depending on the mix), so the thread is idle almost all the time.
 A separate writer thread would add a queue hop and cross-core traffic without taking
 anything slow off this thread. For hundreds of symbols, the next step would be one
 `io_context` per core with the shards spread across them. They already share nothing, so
@@ -319,8 +334,8 @@ the websocket and the REST connections. `--ws-url` only accepts `wss://`.
 ## Replay
 
 ```bash
-./build/binance_capture --replay samples/market_data_spot_BTCUSDT_2026-10-08.csv --output-dir ./replay
-cmp samples/market_data_spot_BTCUSDT_2026-10-08_orderbook.csv replay/market_data_spot_BTCUSDT_2026-10-08_orderbook.csv
+./build/binance_capture --replay samples/market_data_spot_BTCUSDT_2026-10-11.csv --output-dir ./replay
+cmp samples/market_data_spot_BTCUSDT_2026-10-11_orderbook.csv replay/market_data_spot_BTCUSDT_2026-10-11_orderbook.csv
 ```
 
 Replay makes no network calls. It reads the market data file and, if it's there, the
@@ -342,73 +357,87 @@ from depth5 messages, which is how I got the comparison numbers in this README.
 columns on every order book row, and the replay comparison.
 
 ```
-$ scripts/check_run.sh output/market_data_spot_BTCUSDT_2026-10-08.csv
+$ scripts/check_run.sh samples/market_data_spot_BTCUSDT_2026-10-11.csv
 OK    market data header
 OK    order book header
 OK    every order book row has 26 columns
 OK    snapshots header
-OK    replay gives the same market_data_spot_BTCUSDT_2026-10-08_orderbook.csv
+OK    replay gives the same market_data_spot_BTCUSDT_2026-10-11_orderbook.csv
 ```
 
 ## How I tested it
 
-**Unit tests.** 28 of them, in [tests/unit_tests.cpp](tests/unit_tests.cpp) with a small
+**Unit tests.** 30 of them, in [tests/unit_tests.cpp](tests/unit_tests.cpp) with a small
 homemade `TEST`/`CHECK` setup:
 
 - decimal parsing edge cases;
 - RFC 4180 round trips;
 - the book side;
 - every sync case on both venues: seeding from REST and from depth5, buffered diffs older or
-  newer than the snapshot, a snapshot that's too old, gaps, reconnects, a held depth5 and a
-  depth5 catching a wrong level;
-- both CSV formats checked byte for byte;
-- replay with and without REST snapshots;
+  newer than the snapshot, a snapshot that's too old, a hole in the buffer, gaps,
+  reconnects, a held depth5 and a depth5 catching a wrong level. Each one checks the exact
+  rows the event produces, e.g. `S D` for a REST seed with one buffered diff on top;
+- both CSV formats checked byte for byte, including a held depth5's `P` row;
+- replay with and without REST snapshots, plus the row counts (`D` rows = diffs applied,
+  `P` rows = depth5s applied);
 - the allocation counter;
 - CLI parsing.
 
 **Live runs.** Each one was followed by `scripts/check_run.sh`. All on my laptop (WSL2,
-Ubuntu 22.04, i5-12500H, Release build, GCC 12), on 8 Oct 2026:
+Ubuntu 22.04, i5-12500H, Release build, GCC 12), on 11 Oct 2026 with the code as it is now:
 
 | Run | Messages | Gaps | Reconnects | REST snapshots | depth5 checks | Mismatched | Learned | Replay |
 |---|---|---|---|---|---|---|---|---|
-| spot BTCUSDT, 2 min ([the sample](#sample-run)) | 31,867 | 0 | 0 | 1 | 1,182 | 0 | 0 | identical |
-| spot BTCUSDT, 5 min (the checklist command, `--duration 300`) | 38,859 | 0 | 0 | 1 | 2,966 | 0 | 0 | identical |
-| USD-M BTCUSDT, 30 s | 5,647 | 0 | 0 | 1 | 261 | 0 | 0 | identical |
-| spot BTC, ETH, BNB, SOL on 2 connections, 30 s | 17,486 | 0 | 0 | 4 | 1,129 | 0 | 0 | identical, all 4 |
-| spot BTCUSDT, frozen for 75 s to force a reconnect | 19,434 | 0 | 1 | 2 | 815 | 0 | 0 | identical |
-| spot BTC + ETH on 2 connections, ASan + UBSan build, 20 s | 10,042 | 0 | 0 | 2 | 371 | 0 | 0 | identical |
-| spot BTCUSDT with `--snapshot depth5`, 20 s | 4,709 | 0 | 0 | - | 189 | 0 | 13 | identical |
+| spot BTCUSDT, 2 min ([the sample](#sample-run)) | 2,841 | 0 | 0 | 1 | 1,227 | 0 | 0 | identical |
+| spot BTCUSDT, 5 min (the checklist command, `--duration 300`) | 7,664 | 0 | 0 | 1 | 3,083 | 0 | 0 | identical |
+| USD-M BTCUSDT, 30 s | 628 | 0 | 0 | 1 | 229 | 0 | 0 | identical |
+| spot BTC, ETH, BNB, SOL on 2 connections, 30 s | 2,120 | 0 | 0 | 4 | 918 | 0 | 0 | identical, all 4 |
+| spot BTCUSDT, frozen for 150 s to force a reconnect | 2,529 | 0 | 1 | 2 | 895 | 0 | 0 | identical |
+| spot BTC + ETH on 2 connections, ASan + UBSan build, 20 s | 1,084 | 0 | 0 | 2 | 385 | 0 | 0 | identical |
+| spot BTCUSDT with `--snapshot depth5`, 20 s | 470 | 0 | 0 | - | 198 | 0 | 0 | identical |
+
+In every run the order book file had exactly one `D` row per applied diff and one `P` row
+per applied depth5 (rows counted against the counters), and its timestamps never went
+backwards. A run pointed at a port where nothing listens exits with code 4 and
+`connects=0 connect_failures=4`.
+
+I ran the same set on 8 Oct, while the market was much busier: 31,867 messages in the
+2-minute run, 38,859 in the 5-minute one. The book results were the same: no gaps, no
+mismatches, every replay identical.
 
 The fresh-clone build was also checked both ways the assignment's checklist does it: Ninja
 with `g++-12` and `-Wall -Wextra -O2`, and plain `cmake -B build && cmake --build build`
 (GCC 11.4, make). Both gave no warnings and all tests passed.
 
-The forced reconnect: I froze the process with `SIGSTOP` for 75 s so Binance would drop the
-connection. When it resumed, the read failed ("stream truncated"), it reconnected 0.5 s
-later with `conn_epoch=1`, wrote an `R` row, had a new REST snapshot about 0.4 s after that
-and carried on.
+The forced reconnect: I froze the process with `SIGSTOP` so Binance would drop the
+connection. On 8 Oct 75 s was enough; on this quiet morning Binance kept a connection that
+had been frozen for 78 s, so this run froze it for 150 s. When it resumed, the read failed
+("End of file"), it reconnected 0.5 s later with `conn_epoch=1`, wrote an `R` row, had a
+new REST snapshot about 0.6 s after that and carried on.
 
 ## Performance
 
 All from the runs above, on the same laptop.
 
-- **Per message.** This is the time from a websocket message being fully read to both CSV
-  rows being formatted, measured with `steady_clock` into power-of-two buckets. The median
-  was 2-4 µs in every run. p99 was under 131 µs on spot and under 524 µs on USD-M, whose
-  diffs often carry hundreds of levels. The slowest single message in any run took 1.8 ms.
-  The tail includes the occasional inline 256 KB `fwrite` (see Writing files above).
-- **Load.** Over a whole run, BTCUSDT spot averaged 90-270 messages per second, with bursts
-  above 700 per second. The 5-minute checklist run used 1.2 s of CPU in total (about 0.4% of
-  one core) and 14 MB of memory.
+- **Per message.** This is the time from a websocket message being fully read to all its
+  CSV rows being formatted, measured with `steady_clock` into power-of-two buckets. The
+  median was 8-16 µs this morning, when most messages were diffs and depth5s. On 8 Oct,
+  when most messages were trades (cheap: no book change), it was 2-4 µs. p99 was under
+  131 µs on spot and under 262 µs on USD-M, whose diffs often carry hundreds of levels. The
+  slowest single message in any run took 2.1 ms. The tail includes the occasional inline
+  256 KB `fwrite` (see Writing files above).
+- **Load.** The 5-minute checklist run averaged 25 messages per second and used 0.86 s of
+  CPU in total (about 0.3% of one core) and 15 MB of memory. On 8 Oct the same command
+  averaged 130 messages per second, and that day's 2-minute run had bursts above 700.
 - **Replay** runs the same processing code without the network, so it shows how fast that
-  code is on its own: about 400,000 messages per second for spot BTCUSDT (the 5-minute,
-  17 MB capture replays in 0.1 s) and about 200,000 per second for USD-M. Both numbers include
-  reading the CSV back in.
+  code is on its own. The 5-minute capture (7,664 messages, 3 MB) replays in 23 ms, about
+  330,000 messages per second including reading the CSV back in. 8 Oct's trade-heavy
+  5-minute capture went at about 400,000 per second.
 
 ## Sample run
 
-[samples/](samples) has 2 minutes of BTCUSDT spot, recorded 8 Oct 2026 between 15:36 and
-15:38 UTC with:
+[samples/](samples) has 2 minutes of BTCUSDT spot, recorded 11 Oct 2026 between 02:16 and
+02:18 UTC (a quiet Sunday morning) with:
 
 ```bash
 ./build/binance_capture --venue spot --symbols BTCUSDT --output-dir ./output --duration 120
@@ -416,57 +445,62 @@ All from the runs above, on the same laptop.
 
 | File | Rows | Size |
 |---|---|---|
-| [market_data_spot_BTCUSDT_2026-10-08.csv](samples/market_data_spot_BTCUSDT_2026-10-08.csv) | 31,867 (29,495 trade, 1,186 depth_diff, 1,186 depth5) | 12.5 MB |
-| [market_data_spot_BTCUSDT_2026-10-08_orderbook.csv](samples/market_data_spot_BTCUSDT_2026-10-08_orderbook.csv) | 30,548 (1 `S`, 1,182 `D`, 29,365 `T`) | 7.7 MB |
-| [market_data_spot_BTCUSDT_2026-10-08_snapshots.csv](samples/market_data_spot_BTCUSDT_2026-10-08_snapshots.csv) | 1 (5000 levels per side) | 0.4 MB |
+| [market_data_spot_BTCUSDT_2026-10-11.csv](samples/market_data_spot_BTCUSDT_2026-10-11.csv) | 2,841 (1,232 depth_diff, 1,232 depth5, 377 trade) | 1.2 MB |
+| [market_data_spot_BTCUSDT_2026-10-11_orderbook.csv](samples/market_data_spot_BTCUSDT_2026-10-11_orderbook.csv) | 2,833 (1 `S`, 1,229 `D`, 1,227 `P`, 376 `T`) | 0.7 MB |
+| [market_data_spot_BTCUSDT_2026-10-11_snapshots.csv](samples/market_data_spot_BTCUSDT_2026-10-11_snapshots.csv) | 1 (5000 levels per side) | 0.4 MB |
 
-That's bigger than you'd expect for two minutes. BTC got busy near the end, and about 7,700
-messages, nearly all trades, came in during one 10-second stretch. These are the counters
-printed at the end of the run:
+These are the counters printed at the end of the run:
 
 ```
-[live] transport: connects=1 disconnects=0 messages=31867 bytes=10429296 envelope_errors=0 unknown_streams=0 minified_payloads=0
-[live] book: diffs_applied=1183 diffs_stale=3 diffs_buffered=4 buffer_overflows=0 gaps=0 epoch_resets=0 seeds=1 seed_failures=0 decode_errors=0
-[live] depth5: checks=1182 stale=0 superseded=0 ignored=4 levels_mismatched=0 levels_learned=0 | trades=29495 uncertain_rows=0
-[live] rest: requested=1 received=1 unused=0 errors=0 weight_1m=250
-[live] output: market_rows=31867 book_rows=30548 write_errors=0
-[live] latency (read->rows, ns): n=31867 mean=5465 p50<=4096 p99<=131072 max=1192767
+[live] transport: connects=1 connect_failures=0 disconnects=0 messages=2841 bytes=1006191 envelope_errors=0 unknown_streams=0 minified_payloads=0
+[live] book: diffs_applied=1229 diffs_stale=3 diffs_buffered=5 buffer_overflows=0 gaps=0 epoch_resets=0 seeds=1 seed_failures=0 decode_errors=0
+[live] depth5: checks=1227 stale=0 superseded=0 ignored=5 levels_mismatched=0 levels_learned=0 | trades=377 uncertain_rows=0
+[live] rest: requested=1 received=1 unused=0 errors=0 weight_1m=750
+[live] output: market_rows=2841 book_rows=2833 write_errors=0
+[live] latency (read->rows, ns): n=2841 mean=18068 p50<=16384 p99<=65536 max=2109788
 ```
 
-- The REST snapshot was requested when the first diff arrived and came back 357 ms later.
-  In the meantime 4 diffs were buffered: 3 were already covered by the snapshot
-  (`diffs_stale=3`) and one was applied on top. The 4 depth5 messages from that window were
-  ignored.
-- There were no gaps. Every depth5 after that (1,182 of them) was checked against the book;
-  none disagreed, and none showed a level the book didn't already have.
-- There are no `P` rows. On BTCUSDT every depth5 arrived just before its diff, so it was
-  checked together with that diff, and the result is that diff's `D` row.
-- Replaying the same capture with `--snapshot depth5` gives `levels_learned=35`. That's the
-  difference the REST snapshot makes.
+- The REST snapshot was requested when the first diff arrived and came back 408 ms later.
+  In the meantime 5 diffs were buffered: 3 were already covered by the snapshot
+  (`diffs_stale=3`) and 2 were applied on top. The 5 depth5 messages from that window were
+  ignored. (`weight_1m=750` because I had two other captures running at the same time.)
+- There were no gaps. Every depth5 after that (1,227 of them) was applied and checked
+  against the book; none disagreed, and none showed a level the book didn't already have.
+- The row counts line up: 1,229 `D` rows for `diffs_applied=1229` and 1,227 `P` rows for
+  `checks=1227`. One trade arrived before the book was live, so it has a market data row but
+  no `T` row (377 trades, 376 `T` rows).
+- Replaying the same capture with `--snapshot depth5` gives `levels_learned=2`: twice,
+  depth5 showed the book a level it didn't know about. On the much busier 8 Oct sample the
+  same comparison gave 35.
 
 The first rows of each file (payloads cut short):
 
 ```
 recv_tsec,recv_tnsec,venue,stream_kind,shard_id,conn_epoch,conn_seq,symbol,payload_json
-1791473780,992911136,spot,depth5,0,0,0,BTCUSDT,"{""lastUpdateId"":101202754469,""bids"":[[""81195.48000000"",""4.99091000""],...
-1791473780,992965884,spot,depth_diff,0,0,1,BTCUSDT,"{""e"":""depthUpdate"",""E"":1791473780814,""s"":""BTCUSDT"",""U"":101202754407,""u"":101202754469,...
-1791473781,6676726,spot,trade,0,0,2,BTCUSDT,"{""e"":""trade"",""E"":1791473780830,""s"":""BTCUSDT"",""t"":6748388776,""p"":""81195.49000000"",...
+1791685015,430905261,spot,trade,0,0,0,BTCUSDT,"{""e"":""trade"",""E"":1791685015342,""s"":""BTCUSDT"",""t"":6752527017,""p"":""83053.45000000"",...
+1791685015,490731037,spot,depth5,0,0,1,BTCUSDT,"{""lastUpdateId"":101273591789,""bids"":[[""83053.44000000"",""4.40461000""],...
+1791685015,491011445,spot,depth_diff,0,0,2,BTCUSDT,"{""e"":""depthUpdate"",""E"":1791685015415,""s"":""BTCUSDT"",""U"":101273591765,""u"":101273591789,...
 ```
 
 ```
 tsec,tnsec,seqNo,id,type,side,bid0,bid1,bid2,bid3,bid4,bid_size0,bid_size1,bid_size2,bid_size3,bid_size4,ask0,ask1,ask2,ask3,ask4,ask_size0,ask_size1,ask_size2,ask_size3,ask_size4
-1791473781,350798062,1,2014473836,S,N,8120551000000,8120550000000,8120549000000,8120523000000,8120462000000,459351000,16292000,13000,8000,293522000,8120552000000,8120553000000,8120658000000,8120793000000,8120838000000,160000,828000,18000,7000,7000
-1791473781,358286598,2,2014473836,T,S,8120551000000,8120550000000,8120549000000,8120523000000,8120462000000,459351000,16292000,13000,8000,293522000,8120552000000,8120553000000,8120658000000,8120793000000,8120838000000,160000,828000,18000,7000,7000
+1791685015,899220099,1,2014473836,S,N,8305344000000,8305343000000,8305342000000,8305341000000,8305340000000,434467000,83000,13000,14000,5000000,8305345000000,8305346000000,8305347000000,8305365000000,8305377000000,220485000,38069000,13000,194000,363000
+1791685015,899220099,2,2014473836,D,N,8305344000000,8305343000000,8305342000000,8305341000000,8305340000000,436274000,83000,13000,14000,5000000,8305345000000,8305346000000,8305347000000,8305365000000,8305377000000,220685000,38069000,13000,194000,363000
+1791685015,899220099,3,2014473836,D,N,8305344000000,8305343000000,8305342000000,8305341000000,8305340000000,436346000,83000,13000,14000,5000000,8305345000000,8305346000000,8305347000000,8305365000000,8305400000000,220692000,38076000,13000,194000,14000
+1791685015,990514752,4,2014473836,P,N,8305344000000,8305343000000,8305342000000,8305341000000,8305340000000,438153000,83000,13000,14000,5000000,8305345000000,8305346000000,8305347000000,8305365000000,8305400000000,216492000,38076000,13000,194000,14000
+1791685015,990514752,5,2014473836,D,N,8305344000000,8305343000000,8305342000000,8305341000000,8305340000000,438153000,83000,13000,14000,5000000,8305345000000,8305346000000,8305347000000,8305365000000,8305400000000,216492000,38076000,13000,194000,14000
 ```
 
-- The first market data rows are a depth5 and a diff from before the book existed (that diff
-  is what triggered the REST request), then trades.
-- The snapshot (`lastUpdateId` 101202756049) arrived right after market data row
-  `conn_seq=137`, a diff with `U = 101202756050`, which is exactly the next update. So the `S`
-  row is the snapshot plus that diff. That's why its best bid is 81205.51 and not the
-  snapshot's own 81204.60. (`8120551000000` = 81205.51000000 USDT.)
-- Order book row 2 is a trade with `m=false`: a buyer took the best ask (`S`), and the book
-  itself is unchanged.
+- The REST snapshot (`lastUpdateId` 101273591826) arrived right after market data row
+  `conn_seq=10`. The buffered diffs ending at ...789, ...805 and ...826 were already in it.
+  The next two (...827-...831 and ...832-...848) connect to it and were applied on top. So
+  the book starts with an `S` row (the snapshot alone) and two `D` rows, all three stamped
+  with the time the REST answer arrived.
+- Rows 4 and 5 are the usual spot pattern. The depth5 with id ...853 (`conn_seq=11`) arrived
+  15 µs before the diff ending at ...853 (`conn_seq=12`). It was held, then applied right
+  before that diff. Its `P` row (the top 5 as of ...853) and the diff's `D` row both carry
+  the diff's receive time.
+- `8305344000000` = 83053.44000000 USDT.
 
 ## Things that went wrong along the way
 
@@ -488,17 +522,28 @@ tsec,tnsec,seqNo,id,type,side,bid0,bid1,bid2,bid3,bid4,bid_size0,bid_size1,bid_s
 - **The book started from depth5 at first.** That worked, but the counters showed depth5
   regularly telling the book about levels it had never seen (`levels_learned` > 0), which is
   what moved me to the REST snapshot.
+- **Not every applied event had its own row.** A depth5 held for its diff was applied, but
+  it only showed up inside that diff's `D` row, so a busy capture could have zero `P` rows.
+  The diffs applied on top of a snapshot were folded into its `S` row. The book itself was
+  right, but the assignment asks for a row after every applied depthUpdate and depth5, and
+  `grep -c ',P,'` printing 0 says otherwise. Someone reviewing the code pointed it out. Now
+  `BookSync` reports every change through a callback and the pipeline writes a row for each,
+  and the tests check the exact row sequence per event. Replaying the old sample with the fix
+  gave the same rows as before plus the missing `P` and `D` rows. The only other difference
+  is that the `S` row now shows the snapshot on its own.
 - **The provided `.gitignore` has `*.csv`**, which would have left the sample run out of the
   repo. I added `!samples/*.csv`.
 
 ## What I'd do next
 
+- Move the `fwrite` calls to a writer thread, handing it full buffers through a small SPSC
+  queue of preallocated buffers, then measure the tail latency again. It's the one thing on
+  the network thread that can take a millisecond.
 - Rotate the output files at UTC midnight. Right now the name uses the date the run started.
 - Take receive timestamps from the kernel (`SO_TIMESTAMPING`) instead of reading the clock in
   the handler.
 - Run a longer soak test, several hours with a few forced reconnects.
-- For hundreds of symbols: one `io_context` per core, and a writer thread if the disk ever
-  shows up in the latency.
+- For hundreds of symbols: one `io_context` per core, with the shards spread across them.
 
 ## Repo layout
 
